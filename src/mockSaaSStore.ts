@@ -14,11 +14,38 @@ export const seededUsers: SaaSUser[] = [
   { id: 'usr_readonly_B', name: 'Pam Beasley (Read-Only)', email: 'pam@vancepools.com', onboarded: true, createdAt: '2026-05-05T09:00:00Z' }
 ];
 
-// Predefined mock workspaces
+// Trial window for the mock trialling workspace, kept relative to now so the demo never
+// rots into a permanently expired trial the way a hardcoded date would.
+const MOCK_TRIAL_STARTED = new Date(Date.now() - 5 * 86400000).toISOString();
+const MOCK_TRIAL_ENDS = new Date(Date.now() + 9 * 86400000).toISOString();
+
+// Predefined mock workspaces. Between them they cover the three entitlement outcomes the
+// gate can produce, so mock mode exercises the real states rather than only the happy path.
 export const seededWorkspaces: Workspace[] = [
-  { id: 'ws_showtime', name: 'Showtime Pool Mechanics', slug: 'showtime-pools', ghlLocationId: 'loc_g53h7s8a', createdAt: '2026-02-15T09:30:00Z', suspended: false },
-  { id: 'ws_apex', name: 'Apex Blue Pools', slug: 'apex-blue', ghlLocationId: 'loc_apex_demo', createdAt: '2026-05-01T12:00:00Z', suspended: false },
-  { id: 'ws_pro_clean', name: 'Pro Clean Builders', slug: 'pro-clean', ghlLocationId: 'loc_pro_demo', createdAt: '2026-05-05T09:00:00Z', suspended: true } // Simulated suspended block
+  // Converted: purchased outright, permanent access.
+  {
+    id: 'ws_showtime', name: 'Showtime Pool Mechanics', slug: 'showtime-pools',
+    ghlLocationId: 'loc_g53h7s8a', createdAt: '2026-02-15T09:30:00Z', suspended: false,
+    trialStartedAt: '2026-02-15T09:30:00Z', trialEndsAt: '2026-03-01T09:30:00Z',
+    trialUsed: true, trialExtensionCount: 0,
+    licenseStatus: 'LICENSED', licensedAt: '2026-02-28T10:00:00Z'
+  },
+  // Mid-trial: 9 days remaining.
+  {
+    id: 'ws_apex', name: 'Apex Blue Pools', slug: 'apex-blue',
+    ghlLocationId: 'loc_apex_demo', createdAt: '2026-05-01T12:00:00Z', suspended: false,
+    trialStartedAt: MOCK_TRIAL_STARTED, trialEndsAt: MOCK_TRIAL_ENDS,
+    trialUsed: true, trialExtensionCount: 0,
+    licenseStatus: 'NONE', licensedAt: null
+  },
+  // Suspended: operator override outranks its live trial.
+  {
+    id: 'ws_pro_clean', name: 'Pro Clean Builders', slug: 'pro-clean',
+    ghlLocationId: 'loc_pro_demo', createdAt: '2026-05-05T09:00:00Z', suspended: true,
+    trialStartedAt: MOCK_TRIAL_STARTED, trialEndsAt: MOCK_TRIAL_ENDS,
+    trialUsed: true, trialExtensionCount: 0,
+    licenseStatus: 'NONE', licensedAt: null
+  }
 ];
 
 // Workspace memberships linking users to workspaces with granular roles
@@ -178,13 +205,22 @@ export class MockDatabase {
     // Create secure new Tenant Workspace
     const slug = companyName.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-');
     const workspaceId = `ws_${Date.now()}`;
+    // Onboarding starts the 14-day trial, mirroring /api/auth/onboarding. Without a trial
+    // window a new workspace derives to NOT_STARTED and the entitlement gate denies it.
+    const now = Date.now();
     const newWs: Workspace = {
       id: workspaceId,
       name: companyName,
       slug,
       ghlLocationId: ghlMode === 'LIVE' ? 'loc_live_' + slug.slice(0, 8) : 'loc_mock_' + slug.slice(0, 8),
-      createdAt: new Date().toISOString(),
-      suspended: false
+      createdAt: new Date(now).toISOString(),
+      suspended: false,
+      trialStartedAt: new Date(now).toISOString(),
+      trialEndsAt: new Date(now + 14 * 86400000).toISOString(),
+      trialUsed: true,
+      trialExtensionCount: 0,
+      licenseStatus: 'NONE',
+      licensedAt: null
     };
     this.workspaces.push(newWs);
 

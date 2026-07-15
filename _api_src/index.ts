@@ -14,6 +14,7 @@ import {
 } from '../src/mockReportingData.js';
 import { LiveReportingService, invalidateWorkspaceCacheStore } from '../src/ghlService.js';
 import { supabaseAdmin, supabaseSignIn } from '../src/supabase.js';
+import { deriveEntitlement, newTrialWindow, type Entitlement } from '../src/entitlements.js';
 
 import dotenv from 'dotenv';
 dotenv.config();
@@ -39,8 +40,30 @@ function toWorkspace(row: any): Workspace {
     slug: row.slug,
     ghlLocationId: row.ghl_location_id,
     createdAt: row.created_at,
-    suspended: row.suspended
+    suspended: row.suspended,
+    // Defaults match the column defaults in 0004 so a row selected before that
+    // migration (or with a narrowed select) degrades to "no trial, no licence"
+    // rather than throwing.
+    trialStartedAt: row.trial_started_at ?? null,
+    trialEndsAt: row.trial_ends_at ?? null,
+    trialUsed: row.trial_used ?? false,
+    trialExtensionCount: row.trial_extension_count ?? 0,
+    licenseStatus: row.license_status ?? 'NONE',
+    licensedAt: row.licensed_at ?? null
   };
+}
+
+/** Derives the live access decision for a workspace. Server-side authority. */
+function workspaceEntitlement(ws: Workspace): Entitlement {
+  return deriveEntitlement({
+    trialStartedAt: ws.trialStartedAt,
+    trialEndsAt: ws.trialEndsAt,
+    trialUsed: ws.trialUsed,
+    trialExtensionCount: ws.trialExtensionCount,
+    licenseStatus: ws.licenseStatus,
+    licensedAt: ws.licensedAt,
+    suspended: ws.suspended
+  });
 }
 
 function toMember(row: any): WorkspaceMember {
@@ -555,6 +578,20 @@ export const requireAuth = (allowedRoles?: UserRole[]) => {
       if (allowedRoles && allowedRoles.length > 0 && !allowedRoles.includes(role)) {
         return res.status(403).json({ status: 'error', error: `Access Denied: insufficient role.` });
       }
+      // Same entitlement gate as the password path. This branch returns early, so without
+      // it an expired tenant could keep full access simply by entering through the GHL
+      // marketplace iframe instead of the login form.
+      const ssoEntitlement = workspaceEntitlement(workspace);
+      if (!ssoEntitlement.hasAccess) {
+        return res.status(403).json({
+          status: 'error',
+          error: ssoEntitlement.denialReason,
+          accessDenied: true,
+          entitlement: ssoEntitlement,
+          suspended: ssoEntitlement.accessStatus === 'SUSPENDED'
+        });
+      }
+      req.entitlement = ssoEntitlement;
       req.user = { id: ssoPayload.userId || 'ghl_sso', email: ssoPayload.email || '', name: ssoPayload.email || '', onboarded: true, createdAt: new Date().toISOString() };
       req.workspace = workspace;
       req.member = null;
@@ -620,6 +657,29 @@ export const requireAuth = (allowedRoles?: UserRole[]) => {
 
     if (allowedRoles && allowedRoles.length > 0 && !allowedRoles.includes(role)) {
       return res.status(403).json({ status: 'error', error: `Access Denied: Role "${role}" does not have sufficient permissions.` });
+    }
+
+    // ---- ENTITLEMENT GATE ----
+    // The authoritative trial/licence check. Runs on every protected route because it
+    // lives in the shared middleware; the workspace row is already loaded above, so this
+    // costs no additional query.
+    //
+    // SUPER_ADMIN is exempt by design: platform staff must be able to reach a locked-out
+    // tenant in order to activate its licence or extend its trial. Gating them would make
+    // an expired workspace unrecoverable through the product.
+    const entitlement = workspaceEntitlement(workspace);
+    req.entitlement = entitlement;
+
+    if (!entitlement.hasAccess && !isSuperAdmin) {
+      return res.status(403).json({
+        status: 'error',
+        error: entitlement.denialReason,
+        // Distinguishes "your trial ended" from "your role is too low" — both are 403,
+        // and the client must not treat this one as a credential failure and log out.
+        accessDenied: true,
+        entitlement,
+        suspended: entitlement.accessStatus === 'SUSPENDED'
+      });
     }
 
     req.user = user;
@@ -696,7 +756,18 @@ app.post('/api/auth/login', async (req, res) => {
   await logAction(activeWorkspace?.id || null, authUser.id, authUser.email || '', 'USER_LOGIN',
     impersonateToken ? `Authenticated via Playground as ${role}` : 'Authenticated via email+password');
 
-  res.json({ status: 'success', session: { user, activeWorkspace, memberRecord: member, role, token: sessionToken }, workspaces });
+  // Login is deliberately NOT entitlement-gated. An expired tenant must still be able to
+  // authenticate and be told why it is locked, rather than being bounced to the login form
+  // as though the password were wrong. The entitlement below drives that UI; the gate in
+  // requireAuth() is what actually protects the data.
+  res.json({
+    status: 'success',
+    session: {
+      user, activeWorkspace, memberRecord: member, role, token: sessionToken,
+      entitlement: activeWorkspace ? workspaceEntitlement(activeWorkspace) : null
+    },
+    workspaces
+  });
 });
 
 app.post('/api/auth/signup', async (req, res) => {
@@ -742,12 +813,27 @@ app.post('/api/auth/onboarding', async (req, res) => {
   const slug = companyName.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-');
   const workspaceId = `ws_${Date.now()}`;
 
+  // Onboarding is where the 14-day trial begins — this is the existing product flow
+  // (the legacy subscriptions row below has always dated its trial from here).
+  //
+  // These columns are REQUIRED. Without them the workspace defaults to license_status
+  // 'NONE' with no trial window, which derives to NOT_STARTED, and the entitlement gate
+  // in requireAuth() would deny every request from a freshly onboarded tenant.
+  //
+  // trial_used is set now and never cleared, so an organisation cannot obtain a second
+  // free trial by having its dates reset.
+  const trial = newTrialWindow();
+
   await supabaseAdmin.from('workspaces').insert({
     id: workspaceId,
     name: companyName,
     slug,
     ghl_location_id: ghlMode === 'LIVE' ? `loc_live_${slug.slice(0, 8)}` : `loc_mock_${slug.slice(0, 8)}`,
-    suspended: false
+    suspended: false,
+    trial_started_at: trial.trialStartedAt,
+    trial_ends_at: trial.trialEndsAt,
+    trial_used: true,
+    license_status: 'NONE'
   });
 
   await supabaseAdmin.from('workspace_members').insert({
@@ -824,7 +910,16 @@ app.get('/api/auth/me', async (req: any, res) => {
   const member = activeWorkspace ? await getWorkspaceMember(activeWorkspace.id, authUser.id) : null;
   const role: UserRole = member?.role === UserRole.SUPER_ADMIN ? UserRole.SUPER_ADMIN : (member?.role as UserRole || UserRole.READ_ONLY);
 
-  res.json({ status: 'success', session: { user, activeWorkspace, memberRecord: member, role, token }, workspaces });
+  // Ungated for the same reason as login: this is how the client learns it is locked out.
+  // Gating this route would 403 the session check and bounce the user to the login form.
+  res.json({
+    status: 'success',
+    session: {
+      user, activeWorkspace, memberRecord: member, role, token,
+      entitlement: activeWorkspace ? workspaceEntitlement(activeWorkspace) : null
+    },
+    workspaces
+  });
 });
 
 app.post('/api/auth/switch-workspace', async (req, res) => {

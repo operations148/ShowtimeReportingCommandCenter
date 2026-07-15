@@ -449,6 +449,16 @@ export interface Workspace {
   ghlLocationId: string;
   createdAt: string;
   suspended: boolean;
+
+  // Stored entitlement facts (migration 0004). The trial/access *states* are not stored —
+  // they are derived from these by deriveEntitlement() in src/entitlements.ts, because
+  // time-dependent states would go stale in a column. Do not add a status field here.
+  trialStartedAt: string | null;
+  trialEndsAt: string | null;
+  trialUsed: boolean;
+  trialExtensionCount: number;
+  licenseStatus: 'NONE' | 'LICENSED' | 'REVOKED';
+  licensedAt: string | null;
 }
 
 export interface WorkspaceMember {
