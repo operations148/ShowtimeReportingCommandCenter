@@ -661,6 +661,12 @@ app.post('/api/auth/login', async (req, res) => {
   // Use direct REST sign-in — never call supabaseAdmin.auth.signInWithPassword()
   // as it mutates the singleton's session and breaks all subsequent .from() queries.
   const signInResult = await supabaseSignIn(loginEmail, loginPassword);
+  // A misconfigured or unreachable auth service is not a bad password — reporting
+  // it as 401 sends users to reset a credential that was never wrong.
+  if (signInResult.kind === 'config' || signInResult.kind === 'network') {
+    console.error('[login] auth backend unavailable:', signInResult.error);
+    return res.status(503).json({ status: 'error', error: signInResult.error });
+  }
   if (signInResult.error || !signInResult.accessToken) {
     return res.status(401).json({ status: 'error', error: 'Invalid credentials. Check your email and password.' });
   }
@@ -1724,6 +1730,16 @@ app.get('/api/reporting/ga4', requireAuth(), async (req: any, res) => {
     const mock = getMockGA4Report();
     return res.json({ status: 'success', connected: true, propertySelected: true, data: { ...mock, source: 'mock', warnings: [`GA4 API error: ${err.message} — showing sample data.`] } });
   }
+});
+
+// Last-resort handler. Express 4 does not forward async rejections here, so this
+// only catches synchronous throws and explicit next(err) — but without it those
+// surface as the platform's plain-text error page, which clients parsing JSON
+// choke on ("Unexpected token 'A'...").
+app.use((err: any, _req: any, res: any, next: any) => {
+  console.error('[unhandled]', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ status: 'error', error: err?.message || 'Internal server error' });
 });
 
 export default app;
