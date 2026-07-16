@@ -21,6 +21,7 @@ import {
   FileSpreadsheet
 } from 'lucide-react';
 import { UserRole } from '../types';
+import EntitlementManagerModal from './EntitlementManagerModal';
 
 interface AdminViewProps {
   dataSourceMode: 'MOCK' | 'LIVE';
@@ -28,6 +29,17 @@ interface AdminViewProps {
   isSyncing: boolean;
   activeRole: UserRole;
   sessionToken: string;
+}
+
+/** Pill styling for the derived access status shown in the workspace table. */
+function accessPill(status: string): { cls: string; dot: string } {
+  switch (status) {
+    case 'LICENSED': return { cls: 'bg-emerald-50 text-emerald-700 border-emerald-200', dot: 'bg-emerald-500' };
+    case 'TRIAL': return { cls: 'bg-blue-50 text-blue-700 border-blue-200', dot: 'bg-blue-500' };
+    case 'EXPIRED': return { cls: 'bg-amber-50 text-amber-700 border-amber-200', dot: 'bg-amber-500' };
+    case 'SUSPENDED': return { cls: 'bg-rose-50 text-rose-700 border-rose-200', dot: 'bg-rose-500' };
+    default: return { cls: 'bg-slate-100 text-slate-500 border-slate-200', dot: 'bg-slate-400' };
+  }
 }
 
 export default function AdminView({ dataSourceMode, onSyncMetrics, isSyncing, activeRole, sessionToken }: AdminViewProps) {
@@ -41,6 +53,9 @@ export default function AdminView({ dataSourceMode, onSyncMetrics, isSyncing, ac
   // Dashboard diagnostic stats
   const [cacheFlushMessage, setCacheFlushMessage] = useState<string | null>(null);
   const [flushing, setFlushing] = useState(false);
+
+  // Workspace whose entitlement modal is open, or null.
+  const [managingWorkspace, setManagingWorkspace] = useState<any | null>(null);
 
   // Load backend Admin data
   const loadAdminState = async () => {
@@ -97,31 +112,12 @@ export default function AdminView({ dataSourceMode, onSyncMetrics, isSyncing, ac
     loadAdminState();
   }, [activeRole, sessionToken]);
 
-  const handleToggleSuspend = async (workspaceId: string, currentSuspended: boolean) => {
-    setErrorMsg(null);
-    setSuccessMsg(null);
-
-    try {
-      const response = await fetch('/api/admin/suspend', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'x-auth-token': sessionToken
-        },
-        body: JSON.stringify({ workspaceId, suspend: !currentSuspended })
-      });
-
-      const payload = await response.json();
-      if (payload.status === 'success') {
-        setSuccessMsg(payload.message);
-        loadAdminState(); // refresh lists
-        setTimeout(() => setSuccessMsg(null), 4000);
-      } else {
-        throw new Error(payload.error || 'Server rejected suspension toggle.');
-      }
-    } catch (e: any) {
-      setErrorMsg(e.message);
-    }
+  // Called after any entitlement mutation in the modal succeeds.
+  const handleEntitlementChanged = () => {
+    setManagingWorkspace(null);
+    setSuccessMsg('Entitlement updated.');
+    loadAdminState();
+    setTimeout(() => setSuccessMsg(null), 4000);
   };
 
   const handleFlushCache = () => {
@@ -222,10 +218,10 @@ export default function AdminView({ dataSourceMode, onSyncMetrics, isSyncing, ac
                     <tr>
                       <th className="p-4 pl-5">Business Tenant</th>
                       <th className="p-4">GHL Location</th>
-                      <th className="p-4">Sub-Plan</th>
+                      <th className="p-4">Access</th>
                       <th className="p-4">Team Size</th>
                       <th className="p-4">GHL Status</th>
-                      <th className="p-4 pr-5 text-right">Perimeter Access</th>
+                      <th className="p-4 pr-5 text-right">Entitlement</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
@@ -241,9 +237,19 @@ export default function AdminView({ dataSourceMode, onSyncMetrics, isSyncing, ac
                           </span>
                         </td>
                         <td className="p-4 text-slate-900 font-bold">
-                          <span className="text-[10px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded font-black border border-blue-150">
-                            {ws.plan || 'STARTER'}
-                          </span>
+                          {ws.entitlement ? (
+                            <span className={`inline-flex items-center gap-1 text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full border ${accessPill(ws.entitlement.accessStatus).cls}`}>
+                              <span className={`w-1 h-1 rounded-full ${accessPill(ws.entitlement.accessStatus).dot}`} />
+                              {ws.entitlement.accessStatus}
+                              {ws.entitlement.accessStatus === 'TRIAL' && ws.entitlement.trialDaysRemaining !== null && (
+                                <span className="opacity-70">· {ws.entitlement.trialDaysRemaining}d</span>
+                              )}
+                            </span>
+                          ) : (
+                            <span className="text-[10px] bg-slate-100 text-slate-500 px-2 py-0.5 rounded font-black border border-slate-200">
+                              {ws.plan || 'STARTER'}
+                            </span>
+                          )}
                         </td>
                         <td className="p-4 text-slate-500 font-mono text-[10px] font-bold">
                           {ws.membersCount || 1} Members
@@ -264,24 +270,11 @@ export default function AdminView({ dataSourceMode, onSyncMetrics, isSyncing, ac
                         </td>
                         <td className="p-4 pr-5 text-right">
                           <button
-                            onClick={() => handleToggleSuspend(ws.id, ws.suspended)}
-                            className={`p-1.5 px-3 rounded-lg text-[10px] font-black uppercase tracking-wider cursor-pointer transition flex items-center gap-1.5 ml-auto border ${
-                              ws.suspended
-                                ? 'bg-amber-50 text-amber-700 border-amber-250 hover:bg-amber-100'
-                                : 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100'
-                            }`}
+                            onClick={() => setManagingWorkspace(ws)}
+                            className="p-1.5 px-3 rounded-lg text-[10px] font-black uppercase tracking-wider cursor-pointer transition flex items-center gap-1.5 ml-auto border bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100"
                           >
-                            {ws.suspended ? (
-                              <>
-                                <Unlock className="w-3 h-3" />
-                                Unsuspend
-                              </>
-                            ) : (
-                              <>
-                                <Lock className="w-3 h-3" />
-                                Suspend Tenant
-                              </>
-                            )}
+                            <Settings className="w-3 h-3" />
+                            Manage
                           </button>
                         </td>
                       </tr>
@@ -471,6 +464,15 @@ export default function AdminView({ dataSourceMode, onSyncMetrics, isSyncing, ac
           </div>
 
         </div>
+      )}
+
+      {managingWorkspace && (
+        <EntitlementManagerModal
+          workspace={managingWorkspace}
+          sessionToken={sessionToken}
+          onClose={() => setManagingWorkspace(null)}
+          onChanged={handleEntitlementChanged}
+        />
       )}
 
     </div>
