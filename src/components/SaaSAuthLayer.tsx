@@ -21,6 +21,8 @@ import {
   PowerOff
 } from 'lucide-react';
 import { UserRole } from '../types';
+import type { Entitlement } from '../entitlements';
+import AccessLockedScreen from './AccessLockedScreen';
 
 interface SaaSAuthLayerProps {
   children: (authContext: {
@@ -32,6 +34,8 @@ interface SaaSAuthLayerProps {
     logout: () => void;
     triggerRefresh: () => void;
     switchWorkspace: (workspaceId: string) => Promise<void>;
+    /** Server-derived access decision. Presentational use only — the gate is server-side. */
+    entitlement: Entitlement | null;
   }) => React.ReactNode;
 }
 
@@ -430,6 +434,22 @@ export default function SaaSAuthLayer({ children }: SaaSAuthLayerProps) {
       );
     }
 
+    // Entitlement lock. The server is the authority — this only renders what it reported on
+    // /api/auth/me. Super admins are exempt server-side, so their entitlement always permits
+    // access and they never reach this branch even when viewing a lapsed workspace.
+    //
+    // Note this is NOT a logout: the session is valid, the workspace's entitlement is not.
+    if (session.entitlement && !session.entitlement.hasAccess) {
+      return (
+        <AccessLockedScreen
+          entitlement={session.entitlement}
+          workspaceName={session.activeWorkspace?.name || 'This workspace'}
+          onLogout={logout}
+          onRetry={triggerRefresh}
+        />
+      );
+    }
+
     return (
       <>
         {/* Render standard app cockpit */}
@@ -441,7 +461,8 @@ export default function SaaSAuthLayer({ children }: SaaSAuthLayerProps) {
           token,
           logout,
           triggerRefresh,
-          switchWorkspace
+          switchWorkspace,
+          entitlement: session.entitlement ?? null
         })}
 
       </>

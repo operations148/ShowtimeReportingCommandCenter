@@ -1032,20 +1032,205 @@ app.get('/api/admin/workspaces', requireAuth([UserRole.SUPER_ADMIN]), async (req
   const list = await Promise.all((allWs || []).map(async (ws: any) => {
     const members = await getMembersByWorkspace(ws.id);
     const conn = await getGHLConnection(ws.id);
+    // Legacy recurring-billing row. Display only — it does not gate anything.
+    // See FUTURE_SUBSCRIPTIONS.md before giving it any meaning.
     const { data: sub } = await supabaseAdmin.from('subscriptions').select('*').eq('workspace_id', ws.id).single();
-    return { ...toWorkspace(ws), membersCount: members.length, connectionStatus: conn?.status || 'DISCONNECTED', plan: sub?.plan || 'N/A', amount: sub?.amount || 0 };
+    const workspace = toWorkspace(ws);
+    return {
+      ...workspace,
+      membersCount: members.length,
+      connectionStatus: conn?.status || 'DISCONNECTED',
+      plan: sub?.plan || 'N/A',
+      amount: sub?.amount || 0,
+      // The live access decision, plus the provenance the console needs to show who
+      // granted a licence and whether it was machine-backfilled.
+      entitlement: workspaceEntitlement(workspace),
+      licenseReference: ws.license_reference ?? null,
+      licensedByUserId: ws.licensed_by_user_id ?? null,
+      suspensionReason: ws.suspension_reason ?? null,
+      suspendedAt: ws.suspended_at ?? null
+    };
   }));
   res.json({ status: 'success', workspaces: list });
 });
 
 app.post('/api/admin/suspend', requireAuth([UserRole.SUPER_ADMIN]), async (req: any, res) => {
-  const { workspaceId, suspend } = req.body;
+  const { workspaceId, suspend, reason } = req.body;
   if (!workspaceId) return res.status(400).json({ status: 'error', error: 'workspaceId is required.' });
   const ws = await getWorkspaceById(workspaceId);
   if (!ws) return res.status(404).json({ status: 'error', error: 'Workspace not found.' });
-  await supabaseAdmin.from('workspaces').update({ suspended: !!suspend }).eq('id', workspaceId);
-  await logAction(workspaceId, req.user.id, req.user.email, 'TOGGLE_SUSPEND_WORKSPACE', `Workspace suspension set to: ${!!suspend}`);
-  res.json({ status: 'success', message: `Workspace "${ws.name}" has been ${suspend ? 'SUSPENDED' : 'ACTIVATED'}.` });
+
+  const on = !!suspend;
+  await supabaseAdmin.from('workspaces').update({
+    suspended: on,
+    // Cleared on restore so stale metadata cannot imply a workspace is still suspended.
+    suspended_at: on ? new Date().toISOString() : null,
+    suspension_reason: on ? (reason || null) : null
+  }).eq('id', workspaceId);
+
+  await logAction(workspaceId, req.user.id, req.user.email, on ? 'SUSPEND_WORKSPACE' : 'RESTORE_WORKSPACE',
+    on ? `Suspended. Reason: ${reason || 'not given'}` : 'Access restored.');
+  res.json({ status: 'success', message: `Workspace "${ws.name}" has been ${on ? 'SUSPENDED' : 'RESTORED'}.` });
+});
+
+// ---- ENTITLEMENT CONTROLS (SUPER ADMIN) ----
+//
+// The manual activation flow. Payment is settled outside the platform, so these endpoints
+// are the only way an organisation becomes licensed. Every one writes an audit record
+// naming the operator — "who activated this licence" must always be answerable.
+
+/**
+ * Converts an organisation to a perpetual licence after an external purchase is confirmed.
+ * This is the trial -> paid transition. There is no expiry and nothing to renew.
+ */
+app.post('/api/admin/entitlement/activate-license', requireAuth([UserRole.SUPER_ADMIN]), async (req: any, res) => {
+  const { workspaceId, reference } = req.body;
+  if (!workspaceId) return res.status(400).json({ status: 'error', error: 'workspaceId is required.' });
+
+  const ws = await getWorkspaceById(workspaceId);
+  if (!ws) return res.status(404).json({ status: 'error', error: 'Workspace not found.' });
+
+  // Refuse rather than silently overwrite: re-activating would replace the original
+  // operator, timestamp and purchase reference, destroying the provenance of the first sale.
+  if (ws.licenseStatus === 'LICENSED') {
+    return res.status(409).json({
+      status: 'error',
+      error: `"${ws.name}" already holds a perpetual licence (granted ${ws.licensedAt}). Revoke it first if you need to re-issue.`
+    });
+  }
+
+  const now = new Date().toISOString();
+  const { error } = await supabaseAdmin.from('workspaces').update({
+    license_status: 'LICENSED',
+    licensed_at: now,
+    licensed_by_user_id: req.supabaseUserId,
+    license_reference: (typeof reference === 'string' && reference.trim()) ? reference.trim() : null,
+    // A licensed org has consumed its trial. Prevents a later revoke from handing back a
+    // "fresh" trial it never earned.
+    trial_used: true
+  }).eq('id', workspaceId);
+  if (error) return res.status(500).json({ status: 'error', error: `Database error: ${error.message}` });
+
+  await logAction(workspaceId, req.user.id, req.user.email, 'ACTIVATE_LICENSE',
+    `Perpetual licence activated by ${req.user.email}. Reference: ${reference || 'not given'}`);
+
+  const updated = await getWorkspaceById(workspaceId);
+  res.json({
+    status: 'success',
+    message: `"${ws.name}" now has permanent licensed access.`,
+    entitlement: updated ? workspaceEntitlement(updated) : null
+  });
+});
+
+/** Extends a trial. Permitted only for super admins, and only against an audit record. */
+app.post('/api/admin/entitlement/extend-trial', requireAuth([UserRole.SUPER_ADMIN]), async (req: any, res) => {
+  const { workspaceId, days, reason } = req.body;
+  if (!workspaceId) return res.status(400).json({ status: 'error', error: 'workspaceId is required.' });
+
+  const n = Number(days);
+  if (!Number.isInteger(n) || n < 1 || n > 365) {
+    return res.status(400).json({ status: 'error', error: 'days must be a whole number between 1 and 365.' });
+  }
+
+  const ws = await getWorkspaceById(workspaceId);
+  if (!ws) return res.status(404).json({ status: 'error', error: 'Workspace not found.' });
+  if (ws.licenseStatus === 'LICENSED') {
+    return res.status(409).json({ status: 'error', error: `"${ws.name}" holds a perpetual licence — a trial extension would have no effect.` });
+  }
+  if (!ws.trialStartedAt || !ws.trialEndsAt) {
+    return res.status(400).json({ status: 'error', error: `"${ws.name}" has no trial to extend.` });
+  }
+
+  // Extend from now when the trial has already elapsed, otherwise from its current end.
+  // Extending from a lapsed end date would grant fewer days than requested — a 7-day
+  // extension on a trial that ended 5 days ago would leave only 2 days of access.
+  const currentEnd = new Date(ws.trialEndsAt).getTime();
+  const base = Math.max(Date.now(), currentEnd);
+  const newEnd = new Date(base + n * 86_400_000).toISOString();
+  const now = new Date().toISOString();
+
+  const { error } = await supabaseAdmin.from('workspaces').update({
+    trial_ends_at: newEnd,
+    trial_extension_count: ws.trialExtensionCount + 1,
+    trial_extended_at: now,
+    trial_extended_by: req.supabaseUserId
+  }).eq('id', workspaceId);
+  if (error) return res.status(500).json({ status: 'error', error: `Database error: ${error.message}` });
+
+  await logAction(workspaceId, req.user.id, req.user.email, 'EXTEND_TRIAL',
+    `Trial extended ${n} day(s) to ${newEnd} by ${req.user.email}. Reason: ${reason || 'not given'}`);
+
+  const updated = await getWorkspaceById(workspaceId);
+  res.json({
+    status: 'success',
+    message: `Trial for "${ws.name}" extended by ${n} day(s).`,
+    entitlement: updated ? workspaceEntitlement(updated) : null
+  });
+});
+
+/**
+ * Withdraws a perpetual licence. Deliberately sets REVOKED rather than reverting to NONE,
+ * so a withdrawn licence stays distinguishable from an org that never purchased.
+ */
+app.post('/api/admin/entitlement/revoke-license', requireAuth([UserRole.SUPER_ADMIN]), async (req: any, res) => {
+  const { workspaceId, reason } = req.body;
+  if (!workspaceId) return res.status(400).json({ status: 'error', error: 'workspaceId is required.' });
+  if (!reason || !String(reason).trim()) {
+    // Required: revoking paid access is consequential and must never be unexplained.
+    return res.status(400).json({ status: 'error', error: 'A reason is required to revoke a licence.' });
+  }
+
+  const ws = await getWorkspaceById(workspaceId);
+  if (!ws) return res.status(404).json({ status: 'error', error: 'Workspace not found.' });
+  if (ws.licenseStatus !== 'LICENSED') {
+    return res.status(409).json({ status: 'error', error: `"${ws.name}" does not hold a licence to revoke.` });
+  }
+
+  const { error } = await supabaseAdmin.from('workspaces').update({
+    license_status: 'REVOKED'
+  }).eq('id', workspaceId);
+  if (error) return res.status(500).json({ status: 'error', error: `Database error: ${error.message}` });
+
+  await logAction(workspaceId, req.user.id, req.user.email, 'REVOKE_LICENSE',
+    `Licence revoked by ${req.user.email}. Reason: ${String(reason).trim()}`);
+
+  const updated = await getWorkspaceById(workspaceId);
+  res.json({
+    status: 'success',
+    message: `Licence for "${ws.name}" has been revoked.`,
+    entitlement: updated ? workspaceEntitlement(updated) : null
+  });
+});
+
+/** Restores a revoked licence without re-issuing it, preserving the original provenance. */
+app.post('/api/admin/entitlement/restore-license', requireAuth([UserRole.SUPER_ADMIN]), async (req: any, res) => {
+  const { workspaceId, reason } = req.body;
+  if (!workspaceId) return res.status(400).json({ status: 'error', error: 'workspaceId is required.' });
+
+  const ws = await getWorkspaceById(workspaceId);
+  if (!ws) return res.status(404).json({ status: 'error', error: 'Workspace not found.' });
+  if (ws.licenseStatus !== 'REVOKED') {
+    return res.status(409).json({ status: 'error', error: `"${ws.name}" has no revoked licence to restore.` });
+  }
+
+  // licensed_at / licensed_by_user_id are left untouched — the original grant still stands,
+  // it was only withdrawn. Overwriting them would rewrite who made the original sale.
+  const { error } = await supabaseAdmin.from('workspaces').update({
+    license_status: 'LICENSED',
+    // Re-assert licensed_at only if it was somehow never set, to satisfy the CHECK constraint.
+    licensed_at: ws.licensedAt ?? new Date().toISOString()
+  }).eq('id', workspaceId);
+  if (error) return res.status(500).json({ status: 'error', error: `Database error: ${error.message}` });
+
+  await logAction(workspaceId, req.user.id, req.user.email, 'RESTORE_LICENSE',
+    `Licence restored by ${req.user.email}. Reason: ${reason || 'not given'}`);
+
+  const updated = await getWorkspaceById(workspaceId);
+  res.json({
+    status: 'success',
+    message: `Licence for "${ws.name}" has been restored.`,
+    entitlement: updated ? workspaceEntitlement(updated) : null
+  });
 });
 
 app.get('/api/admin/users', requireAuth([UserRole.SUPER_ADMIN]), async (req, res) => {

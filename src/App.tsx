@@ -46,6 +46,7 @@ import GlobalSettingsView from './components/GlobalSettingsView';
 import AdminView from './components/AdminView';
 import BillingView from './components/BillingView';
 import SaaSAuthLayer from './components/SaaSAuthLayer';
+import TrialNoticeBanner from './components/TrialNoticeBanner';
 import { UserRole } from './types';
 
 // Fallbacks if server fails/loads
@@ -61,7 +62,10 @@ const initialMetrics: DashboardMetrics = {
   trends: { leads: [], pipeline: [], revenue: [], appointments: [] }
 };
 
-function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, triggerRefresh, switchWorkspace }: any) {
+function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, triggerRefresh, switchWorkspace, entitlement }: any) {
+  // Dismissal is per-session by design: it must reappear on the next visit as the deadline
+  // nears. Persisting it would let a user permanently silence the last warning before lockout.
+  const [trialNoticeDismissed, setTrialNoticeDismissed] = useState(false);
   const [activeTab, setActiveTab] = useState<'dashboard' | 'opportunity-dashboard' | 'sales-dashboard' | 'appointment-dashboard' | 'marketing-dashboard' | 'estimates-dashboard' | 'ghl-settings' | 'settings' | 'admin' | 'billing'>('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const navigate = (tab: typeof activeTab) => { setActiveTab(tab); setSidebarOpen(false); };
@@ -547,6 +551,17 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
 
         {/* Dynamic content rendering with responsive inner wrapper */}
         <div className="flex-1 p-3 pb-16 sm:p-6 sm:pb-12 overflow-y-auto w-full mx-auto" id="dynamic-reporting-scroller">
+
+          {/* Trial countdown. Self-hides outside the 7/3/1-day marks and for licensed
+              workspaces, so it costs nothing to render unconditionally. */}
+          {!trialNoticeDismissed && (
+            <div className="mb-4">
+              <TrialNoticeBanner
+                entitlement={entitlement}
+                onDismiss={() => setTrialNoticeDismissed(true)}
+              />
+            </div>
+          )}
           
           {/* Main notification Banner for empty/offline setup error fallback */}
           {errorState && (
@@ -701,7 +716,7 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
 export default function App() {
   return (
     <SaaSAuthLayer>
-      {({ user, activeWorkspace, role, workspaces, token, logout, triggerRefresh, switchWorkspace }) => (
+      {({ user, activeWorkspace, role, workspaces, token, logout, triggerRefresh, switchWorkspace, entitlement }) => (
         <AppCockpit
           user={user}
           activeWorkspace={activeWorkspace}
@@ -711,6 +726,7 @@ export default function App() {
           logout={logout}
           triggerRefresh={triggerRefresh}
           switchWorkspace={switchWorkspace}
+          entitlement={entitlement}
         />
       )}
     </SaaSAuthLayer>
