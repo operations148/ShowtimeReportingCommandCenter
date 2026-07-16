@@ -145,6 +145,36 @@ async function getMembersByWorkspace(workspaceId: string): Promise<WorkspaceMemb
   return (data || []).map(toMember);
 }
 
+/**
+ * Resolves who created a workspace — the earliest-joined WORKSPACE_OWNER, which is the
+ * account that completed onboarding. Falls back to the earliest member of any role so a
+ * workspace is never shown as ownerless. Used by the Client Trials console.
+ */
+async function getWorkspaceCreator(workspaceId: string): Promise<{ userId: string; name: string; email: string; joinedAt: string } | null> {
+  const { data: rows } = await supabaseAdmin
+    .from('workspace_members')
+    .select('user_id, role, joined_at')
+    .eq('workspace_id', workspaceId)
+    .order('joined_at', { ascending: true });
+  if (!rows || rows.length === 0) return null;
+
+  const owner = rows.find((r: any) => r.role === 'WORKSPACE_OWNER') || rows[0];
+  const profile = await getProfile(owner.user_id);
+  // Email lives in auth.users, not profiles — fetch it via the admin API.
+  let email = '';
+  try {
+    const { data } = await supabaseAdmin.auth.admin.getUserById(owner.user_id);
+    email = data?.user?.email || '';
+  } catch { /* email best-effort; name still shown */ }
+
+  return {
+    userId: owner.user_id,
+    name: profile?.name || email.split('@')[0] || 'Unknown',
+    email,
+    joinedAt: owner.joined_at
+  };
+}
+
 async function getGHLConnection(workspaceId: string): Promise<GHLConnection | null> {
   const { data } = await supabaseAdmin
     .from('ghl_connections')
@@ -1032,6 +1062,7 @@ app.get('/api/admin/workspaces', requireAuth([UserRole.SUPER_ADMIN]), async (req
   const list = await Promise.all((allWs || []).map(async (ws: any) => {
     const members = await getMembersByWorkspace(ws.id);
     const conn = await getGHLConnection(ws.id);
+    const creator = await getWorkspaceCreator(ws.id);
     // Legacy recurring-billing row. Display only — it does not gate anything.
     // See FUTURE_SUBSCRIPTIONS.md before giving it any meaning.
     const { data: sub } = await supabaseAdmin.from('subscriptions').select('*').eq('workspace_id', ws.id).single();
@@ -1048,7 +1079,9 @@ app.get('/api/admin/workspaces', requireAuth([UserRole.SUPER_ADMIN]), async (req
       licenseReference: ws.license_reference ?? null,
       licensedByUserId: ws.licensed_by_user_id ?? null,
       suspensionReason: ws.suspension_reason ?? null,
-      suspendedAt: ws.suspended_at ?? null
+      suspendedAt: ws.suspended_at ?? null,
+      // Who created the workspace — drives the Client Trials console.
+      creator
     };
   }));
   res.json({ status: 'success', workspaces: list });

@@ -49,6 +49,7 @@ import BillingView from './components/BillingView';
 import SaaSAuthLayer from './components/SaaSAuthLayer';
 import TrialNoticeBanner from './components/TrialNoticeBanner';
 import IntegrationsCenterView from './components/IntegrationsCenterView';
+import ClientTrialsView from './components/ClientTrialsView';
 import { UserRole } from './types';
 
 // Fallbacks if server fails/loads
@@ -68,7 +69,7 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
   // Dismissal is per-session by design: it must reappear on the next visit as the deadline
   // nears. Persisting it would let a user permanently silence the last warning before lockout.
   const [trialNoticeDismissed, setTrialNoticeDismissed] = useState(false);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'opportunity-dashboard' | 'sales-dashboard' | 'appointment-dashboard' | 'marketing-dashboard' | 'estimates-dashboard' | 'ghl-settings' | 'integrations' | 'settings' | 'admin' | 'billing'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'opportunity-dashboard' | 'sales-dashboard' | 'appointment-dashboard' | 'marketing-dashboard' | 'estimates-dashboard' | 'ghl-settings' | 'integrations' | 'settings' | 'admin' | 'client-trials' | 'billing'>('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const navigate = (tab: typeof activeTab) => { setActiveTab(tab); setSidebarOpen(false); };
   
@@ -473,6 +474,20 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
               Admin
             </button>
 
+            {/* Client Trials Link */}
+            <button
+              onClick={() => navigate('client-trials')}
+              id="nav-btn-client-trials"
+              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition-all text-left cursor-pointer ${
+                activeTab === 'client-trials'
+                  ? 'bg-blue-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:bg-[#111c2e] hover:text-white'
+              }`}
+            >
+              <Users2 className="w-4 h-4 shrink-0 text-blue-500" />
+              Client Trials
+            </button>
+
             {/* Billing Link */}
             <button
               onClick={() => navigate('billing')}
@@ -717,6 +732,13 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
                   dataSourceMode={config.dataSourceMode} 
                   onSyncMetrics={() => fetchAllReportingData(true)} 
                   isSyncing={isFetchingSub} 
+                  activeRole={role}
+                  sessionToken={token}
+                />
+              )}
+
+              {activeTab === 'client-trials' && (
+                <ClientTrialsView
                   activeRole={role}
                   sessionToken={token}
                 />
