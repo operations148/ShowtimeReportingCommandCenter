@@ -28,6 +28,7 @@ import {
   Building,
   PowerOff,
   Menu,
+  Plug,
   X
 } from 'lucide-react';
 
@@ -47,6 +48,7 @@ import AdminView from './components/AdminView';
 import BillingView from './components/BillingView';
 import SaaSAuthLayer from './components/SaaSAuthLayer';
 import TrialNoticeBanner from './components/TrialNoticeBanner';
+import IntegrationsCenterView from './components/IntegrationsCenterView';
 import { UserRole } from './types';
 
 // Fallbacks if server fails/loads
@@ -66,7 +68,7 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
   // Dismissal is per-session by design: it must reappear on the next visit as the deadline
   // nears. Persisting it would let a user permanently silence the last warning before lockout.
   const [trialNoticeDismissed, setTrialNoticeDismissed] = useState(false);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'opportunity-dashboard' | 'sales-dashboard' | 'appointment-dashboard' | 'marketing-dashboard' | 'estimates-dashboard' | 'ghl-settings' | 'settings' | 'admin' | 'billing'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'opportunity-dashboard' | 'sales-dashboard' | 'appointment-dashboard' | 'marketing-dashboard' | 'estimates-dashboard' | 'ghl-settings' | 'integrations' | 'settings' | 'admin' | 'billing'>('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const navigate = (tab: typeof activeTab) => { setActiveTab(tab); setSidebarOpen(false); };
   
@@ -426,6 +428,20 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
               GHL V2 API Settings
             </button>
 
+            {/* Integrations Center Link */}
+            <button
+              onClick={() => navigate('integrations')}
+              id="nav-btn-integrations"
+              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition-all text-left cursor-pointer ${
+                activeTab === 'integrations'
+                  ? 'bg-blue-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:bg-[#111c2e] hover:text-white'
+              }`}
+            >
+              <Plug className="w-4 h-4 shrink-0 text-blue-500" />
+              Integrations
+            </button>
+
             {/* Settings Link */}
             <button
               onClick={() => navigate('settings')}
@@ -682,6 +698,13 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
                   onRefresh={() => fetchAllReportingData(true)}
                   role={role}
                   token={token}
+                />
+              )}
+
+              {activeTab === 'integrations' && (
+                <IntegrationsCenterView
+                  sessionToken={token}
+                  onNavigate={(t) => navigate(t as typeof activeTab)}
                 />
               )}
 
