@@ -17,6 +17,25 @@
 
     <!-- Standard favicon -->
     <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+
+    <!-- Capture the install prompt before React mounts. `beforeinstallprompt` can fire
+         during initial load, well before the app renders; if we don't preventDefault and
+         stash it here it is lost, and the in-app Install button can never trigger it. The
+         React hook (usePwaInstall) reads window.__pwaInstall and listens for the relayed
+         events below. -->
+    <script>
+      window.__pwaInstall = { deferredPrompt: null, installed: false };
+      window.addEventListener('beforeinstallprompt', function (e) {
+        e.preventDefault();
+        window.__pwaInstall.deferredPrompt = e;
+        window.dispatchEvent(new Event('pwa-installable'));
+      });
+      window.addEventListener('appinstalled', function () {
+        window.__pwaInstall.deferredPrompt = null;
+        window.__pwaInstall.installed = true;
+        window.dispatchEvent(new Event('pwa-installed'));
+      });
+    </script>
   </head>
   <body>
     <div id="root"></div>

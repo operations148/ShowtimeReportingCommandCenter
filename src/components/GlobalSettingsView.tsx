@@ -4,17 +4,18 @@
  */
 
 import React, { useState } from 'react';
-import { 
-  Sliders, 
-  Clock, 
-  Bell, 
-  Database, 
-  Info, 
-  Laptop, 
-  ShieldCheck, 
+import {
+  Sliders,
+  Clock,
+  Bell,
+  Database,
+  Info,
+  Laptop,
+  ShieldCheck,
   CheckCircle2,
   CalendarDays
 } from 'lucide-react';
+import PwaInstallCard from './PwaInstallCard';
 
 const TIMEZONE_KEY = 'reporting_timezone';
 
@@ -170,7 +171,10 @@ export default function GlobalSettingsView() {
 
         {/* Right Info Box */}
         <div className="lg:col-span-1 space-y-6">
-          
+
+          {/* Install to home screen — self-hides where installation is not applicable. */}
+          <PwaInstallCard />
+
           <div className="bg-white border border-slate-200 shadow-sm rounded-xl p-5 space-y-4">
             <h3 className="font-bold text-[#0F172A] text-sm pb-2 border-b border-slate-100 flex items-center gap-1.5">
               <Clock className="w-4 h-4 text-blue-600" />
