@@ -437,6 +437,27 @@ function csvCell(v: string | number | null | undefined): string {
 function buildCSV(headers: string[], rows: (string | number | null | undefined)[][]): string {
   return [headers.map(csvCell), ...rows.map(r => r.map(csvCell))].map(r => r.join(',')).join('\r\n');
 }
+/**
+ * Converts one currency-ish value to whole cents. Accepts numbers and numeric strings;
+ * null, undefined, blank and non-finite values are treated as 0 so a single bad record
+ * can never turn a whole column total into NaN.
+ */
+function toCents(v: unknown): number {
+  // Strip currency symbols, thousands separators and spaces before parsing, so a
+  // pre-formatted string like "1,234.56" sums as 1234.56 rather than silently as 1234.
+  const n = typeof v === 'number' ? v : parseFloat(String(v ?? '').replace(/[$,\s]/g, ''));
+  return Number.isFinite(n) ? Math.round(n * 100) : 0;
+}
+/**
+ * Sums currency values for a CSV total row. Accumulating in integer cents avoids the
+ * floating-point artifacts repeated decimal addition produces (0.1 + 0.2 = 0.30000000000000004),
+ * and the single divide at the end yields a value whose shortest representation is exactly
+ * the 2dp amount — so it serialises as a plain number (no $, no commas) that Excel reads
+ * as numeric, with no formula involved.
+ */
+function sumCurrency(values: unknown[]): number {
+  return values.reduce<number>((cents, v) => cents + toCents(v), 0) / 100;
+}
 function triggerDownload(csvContent: string, filename: string): void {
   const blob = new Blob(['﻿' + csvContent], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
@@ -487,8 +508,11 @@ export default function EstimatesInvoicesDashboardView({ reportData, outstanding
       if (!res.ok || !json.estimates) throw new Error(json.error || 'Export failed');
       const loc = (locationName || 'location').replace(/\s+/g, '');
       const headers = ['Estimate Number', 'Contact Name', 'Contact Email', 'Status', 'Total', 'Sent Date', 'Created Date'];
-      const rows = json.estimates.map((e: any) => [e.estimateNumber, e.contactName, e.contactEmail, e.status, e.total, e.sentDate, e.createdAt]);
+      const rows: (string | number | null | undefined)[][] = json.estimates.map((e: any) => [e.estimateNumber, e.contactName, e.contactEmail, e.status, e.total, e.sentDate, e.createdAt]);
+      // Total sits in the 5th column for estimates; every other cell stays blank.
+      rows.push(['TOTAL', '', '', '', sumCurrency(json.estimates.map((e: any) => e.total)), '', '']);
       triggerDownload(buildCSV(headers, rows), `DashPro-Estimates-${loc}-${todayStr()}.csv`);
+      // Count intentionally still reports json.count, so the TOTAL row does not inflate it.
       setExportError(`✓ ${json.count} estimates exported`);
     } catch (err: any) { setExportError(`Export failed: ${err.message}`); }
     finally { setIsExportingEst(false); }
@@ -514,16 +538,32 @@ export default function EstimatesInvoicesDashboardView({ reportData, outstanding
     const records = outstandingReport.unpaidInvoices.records;
     const loc = (locationName || 'location').replace(/\s+/g, '');
     const headers = ['Invoice Number', 'Contact Name', 'Contact Email', 'Total', 'Amount Due', 'Due Date', 'Days Outstanding', 'Status', 'Sent Date'];
-    const rows = records.map(r => [
+    // Defined once and reused by both the row mapping and the total, so the total can never
+    // drift from the value actually written into the Total column.
+    const invoiceTotalOf = (r: (typeof records)[number]) => (r.total != null ? r.total : r.amount);
+    const rows: (string | number | null | undefined)[][] = records.map(r => [
       r.number || '',
       r.contactName || '',
       r.contactEmail || '',
-      r.total != null ? r.total : r.amount,
+      invoiceTotalOf(r),
       r.amount,
       r.dueDate ? r.dueDate.slice(0, 10) : '',
       r.daysOutstanding,
       r.status,
       r.sentDate ? r.sentDate.slice(0, 10) : ''
+    ]);
+    // Total row: Total and Amount Due are distinct columns and each carries its own sum.
+    // Summed over the full exported `records`, so table search/pagination cannot affect it.
+    rows.push([
+      'TOTAL',
+      '',
+      '',
+      sumCurrency(records.map(invoiceTotalOf)),
+      sumCurrency(records.map(r => r.amount)),
+      '',
+      '',
+      '',
+      ''
     ]);
     triggerDownload(buildCSV(headers, rows), `DashPro-Unpaid-Invoices-${loc}-${todayStr()}.csv`);
   }, [outstandingReport, locationName]);
@@ -533,7 +573,7 @@ export default function EstimatesInvoicesDashboardView({ reportData, outstanding
     const records = outstandingReport.paidInvoices.records;
     const loc = (locationName || 'location').replace(/\s+/g, '');
     const headers = ['Invoice Number', 'Contact Name', 'Contact Email', 'Total', 'Paid Date', 'Status', 'Sent Date'];
-    const rows = records.map(r => [
+    const rows: (string | number | null | undefined)[][] = records.map(r => [
       r.number || '',
       r.contactName || '',
       r.contactEmail || '',
@@ -541,6 +581,17 @@ export default function EstimatesInvoicesDashboardView({ reportData, outstanding
       r.sentDate ? r.sentDate.slice(0, 10) : '',
       r.status,
       r.issuedAt ? r.issuedAt.slice(0, 10) : ''
+    ]);
+    // Sums r.amount because that is exactly what the Total column exports for paid invoices
+    // (the existing field mapping is deliberately left unchanged).
+    rows.push([
+      'TOTAL',
+      '',
+      '',
+      sumCurrency(records.map(r => r.amount)),
+      '',
+      '',
+      ''
     ]);
     triggerDownload(buildCSV(headers, rows), `DashPro-Paid-Invoices-${loc}-${todayStr()}.csv`);
   }, [outstandingReport, locationName]);
