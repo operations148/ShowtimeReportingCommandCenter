@@ -82,7 +82,9 @@ Below is the exhaustive matrix of available variables. Always keep server-only k
 | **`REPORTING_ENABLE_MOCK_FALLBACK`** | Resilience | No | Yes | `true` | Allows safe fallback to populated mock records if a GHL API query fails. |
 | **`AUTH_SECRET`** | Security | Yes | Yes | *None* | Crypto passphrase used for validating workspace JSON Web Tokens or cookies. |
 | **`APP_URL`** | Security | Yes | Yes | *None* | Root URL of your production server; used to authenticate OAuth webhooks or callbacks. |
-| **`DATABASE_URL`** | Core Engine | No | Yes | *None* | Postgres or Cloud SQL database uri. (Uses robust client-side storage state in simple or mock mode). |
+| **`SUPABASE_URL`** | Core Engine | **Yes** | Yes | *None* | Base URL of the Supabase project backing authentication and all tenant data. Must be paired with a `SUPABASE_SERVICE_ROLE_KEY` from the **same** project. Set in both Production and Preview scopes if Preview logins are needed. |
+| **`SUPABASE_SERVICE_ROLE_KEY`** | Core Engine | **Yes** | Yes | *None* | Service-role key for the same Supabase project. Bypasses Row Level Security — never expose to the client, never prefix with `VITE_`. |
+| **`DATABASE_URL`** | Tooling | No | Yes | *None* | Direct Postgres connection string (Session Pooler, IPv4) used only by `scripts/migrate.mjs` for schema migrations. Not read by the deployed API. |
 | **`GHL_AUTH_MODE`** | Integrations | Yes | Yes | `private_token` | `private_token` for single-workspace custom integrations, `oauth` for SaaS marketplace setups. |
 | **`GHL_PRIVATE_INTEGRATION_TOKEN`** | Integrations | Conditionally | Yes | *None* | Key obtained from GoHighLevel Settings > Company/Location > API Keys. |
 | **`GHL_LOCATION_ID`** | Integrations | Conditionally | Yes | *None* | Focus Location identifier to bind the initial custom integration. |
@@ -98,6 +100,16 @@ Below is the exhaustive matrix of available variables. Always keep server-only k
 | **`NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`**| Merchant | No | No | *None* | Public billing key used to instantiate checkout popups on client-side views. |
 
 ---
+
+> **Supabase value hygiene.** When setting `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` via
+> the Vercel dashboard, `vercel env add`, or any scripted transfer, paste the raw value with
+> no surrounding quotes and no leading/trailing whitespace, and confirm the source did not
+> inject a UTF-8 byte-order mark. A BOM-prefixed `SUPABASE_URL` parses as an invalid URL and
+> every login fails as an opaque `"fetch failed"` with no indication of why — this has
+> recurred more than once, typically from PowerShell 5.1 tools that write UTF-8 files with a
+> BOM by default (`[System.IO.File]::WriteAllText` without an explicit `UTF8Encoding($false)`
+> is the usual culprit). **Changing a Vercel environment variable does not affect an
+> already-running deployment** — a new deployment is required afterward.
 
 ### Variable Exposure Classification
 
@@ -156,36 +168,35 @@ git branch -M main
 git push -u origin main
 ```
 
-### Step 2: Configure `vercel.json`
-To route both Express serverless `/api/*` endpoints and serve static index scripts successfully on Vercel, verify that a `vercel.json` file is present in your root directory:
+### Step 2: `vercel.json` (current architecture)
+The `builds`/`routes` schema shown in older revisions of this document (targeting
+`server.ts` directly via `@vercel/node`) is **not** what this project currently uses.
+`server.ts` is the **local development** server only (`npm run dev`, via `tsx`) and is not
+part of the deployed build.
+
+The actual production API is generated from `_api_src/index.ts`, bundled by esbuild into
+`api/index.js` as part of the Vercel build step, then served through the modern
+`buildCommand`/`rewrites` schema:
+
 ```json
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "server.ts",
-      "use": "@vercel/node"
-    },
-    {
-      "src": "package.json",
-      "use": "@vercel/static-build",
-      "config": {
-        "distDir": "dist"
-      }
-    }
-  ],
-  "routes": [
-    {
-      "src": "/api/(.*)",
-      "dest": "server.ts"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "index.html"
-    }
+  "buildCommand": "vite build && npx esbuild _api_src/index.ts --bundle --platform=node --target=node20 --format=cjs --packages=external --outfile=api/index.js",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/index.js": { "maxDuration": 30 }
+  },
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api/index" },
+    { "source": "/((?!api/).*)", "destination": "/index.html" }
   ]
 }
 ```
+
+`api/index.js` is a **generated artifact** — `npx esbuild ...` regenerates it fresh on every
+Vercel build before the function is packaged, so it is never hand-edited. (It is committed
+to the repository, but that committed copy is only a snapshot; Vercel's build step overwrites
+it before deployment, and a stale committed copy has no effect on what actually runs in
+production.)
 
 ### Step 3: Link Vercel Project
 1. Log into your **Vercel Dashboard**.
@@ -282,6 +293,106 @@ When integrating using OAuth, dynamic refresh models are essential. To rotate ma
 During initial connections, these parameters may show as "Unavailable" or "Ad account disconnected":
 * **Reason:** In standard GoHighLevel channels, contacts and opportunities provide conversion data, but **Google Ad Manager** or **Facebook Business suite** integration is required to fetch spent ad budget figures.
 * **SLA Safe Handling:** Until active spend budgets are mapped, the dashboard hides complex formulas and displays a neutral warning in the telemetry indicators: *"Ad Accounts spend disconnected. Mapping standard lead values instead."*
+
+---
+
+## Auth Health Monitoring & Post-Deployment Smoke Test
+
+Authentication depends on Supabase being reachable. Three production incidents have all
+presented identically to an end user (`Authentication service unreachable`) despite different
+underlying causes, so the application now exposes a probe, emits a single alertable event,
+and ships a smoke test.
+
+### 1. Health endpoint
+
+```
+GET /api/health/auth
+  200  {"status":"ok"}         Supabase Auth is configured and reachable
+  503  {"status":"degraded"}   Configuration is invalid, or the Auth service is unreachable
+```
+
+The body is deliberately minimal. The reason, hostname, error codes, and configuration
+diagnostics are written to the **server log only** — exposing them publicly would turn an
+uptime probe into a reconnaissance endpoint. It authenticates no user, sends no service-role
+key upstream, and caches its result for 30 seconds so polling cannot be amplified into
+upstream load.
+
+### 2. Uptime monitor — required external setup (NOT configured automatically)
+
+Configure **one** of the following manually. None of this can be done from the repository,
+and no monitoring is active until you complete it and confirm a real test alert arrives.
+
+**Option A — Vercel (no extra vendor):**
+1. Vercel Dashboard → project `reporting-command-center` → **Observability** → **Monitors**
+   (availability checks require a Pro plan; confirm availability on your plan first).
+2. New monitor → URL `https://<your-production-domain>/api/health/auth`, method `GET`.
+3. Interval **5 minutes**; expected status **200**.
+4. Failure threshold **2 consecutive failures** before alerting — a single brief network
+   interruption should not page anyone.
+5. Add notification channel (email / Slack) and enable recovery notifications.
+
+**Option B — external uptime service** (UptimeRobot, Better Uptime, Pingdom, etc.):
+1. New HTTP(S) monitor → `https://<your-production-domain>/api/health/auth`.
+2. Interval 5 minutes; treat **only HTTP 200** as up.
+3. Confirmation/retry setting: alert after **2 consecutive failures**.
+4. Enable the "back up" / recovery notification.
+
+### 3. Log-based alerting on repeated auth failures
+
+The API emits one structured JSON line when authentication infrastructure fails after
+exhausting its retry:
+
+```json
+{"event":"AUTH_UPSTREAM_UNAVAILABLE","timestamp":"…","route":"/api/auth/login",
+ "attempts":2,"classification":"network","causeCode":"ECONNRESET","timedOut":false,
+ "env":"production","deploymentId":"…","commit":"…"}
+```
+
+It contains no email, password, token, key, or raw environment value. It is **not** emitted
+when a retry succeeds, and never for a rejected password — so any occurrence is a real
+infrastructure event.
+
+To alert on it: Vercel Dashboard → **Logs** → filter `AUTH_UPSTREAM_UNAVAILABLE` → save as a
+Log Drain or connect a drain (Datadog, Better Stack, Axiom) and alert when the count exceeds
+~3 in 5 minutes. Alerting on `/api/auth/login` responses with status `503` is an equivalent
+signal if log drains are unavailable. A related `AUTH_HEALTH_DEGRADED` event is emitted by
+the health endpoint itself and carries the specific reason.
+
+### 4. Post-deployment smoke test (run after every production deploy)
+
+```bash
+BASE_URL=https://<your-production-domain> npx tsx scripts/smoke-test-production.ts
+```
+
+Checks `/api/health/auth` → 200, login-without-email → 400, `/api/auth/me` without token →
+401, a protected route without token → 401, and that **bad credentials return 401 rather than
+503** (a 503 there means the backend is unreachable and the deploy is not healthy).
+
+To additionally exercise a real login, supply credentials **via environment only** — never as
+command arguments, which are visible in process listings and shell history:
+
+```bash
+SMOKE_EMAIL=… SMOKE_PASSWORD=… BASE_URL=https://<your-production-domain> \
+  npx tsx scripts/smoke-test-production.ts
+```
+
+The script prints no password, JWT, key, or authorization header under any outcome, and exits
+non-zero on failure so it can gate a deploy pipeline.
+
+### 5. Supabase auto-pause (operational risk — cannot be fixed in code)
+
+Supabase **Free tier projects pause automatically after ~7 days of inactivity**, and a paused
+project is indistinguishable from a deleted one from the application's perspective: DNS stops
+resolving and every login fails. This has already caused at least one production outage in
+this project.
+
+**No application code can prevent a provider from pausing or taking a project offline**, and
+generating artificial database traffic to evade pausing is not a supported fix — it is
+fragile and does not stop Supabase from reaping an idle project.
+
+The only durable remedy is an account-level change: **Supabase Dashboard → Project →
+Settings → Billing → upgrade to Pro**, which removes auto-pause. Verify the current plan
+under Settings → Billing; if it shows Free, the risk is live.
 
 ---
 

@@ -17,8 +17,11 @@ const OLD_CACHES  = [
   'dashpro-shell-v3', 'dashpro-data-v3'
 ];
 
-// Auth-related paths that must NEVER be served from cache
-const AUTH_PATHS = ['/api/auth/', '/api/ghl/sso'];
+// Auth-related paths that must NEVER be served from cache.
+// /api/health/ is included deliberately: it is a GET under /api/, so without this it would
+// fall into the network-first data cache below and could serve a stale {"status":"ok"}
+// during a live outage — the one thing a health probe must never do.
+const AUTH_PATHS = ['/api/auth/', '/api/ghl/sso', '/api/health/'];
 
 self.addEventListener('install', e => {
   e.waitUntil(

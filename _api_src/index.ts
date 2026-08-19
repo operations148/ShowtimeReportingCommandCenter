@@ -13,7 +13,7 @@ import {
   getMarketingPerformanceReport
 } from '../src/mockReportingData.js';
 import { LiveReportingService, invalidateWorkspaceCacheStore } from '../src/ghlService.js';
-import { supabaseAdmin, supabaseSignIn } from '../src/supabase.js';
+import { supabaseAdmin, supabaseSignIn, classifyFetchError, safeConfigDiagnostics, checkAuthReachability, logAuthUpstreamUnavailable } from '../src/supabase.js';
 import { deriveEntitlement, newTrialWindow, type Entitlement } from '../src/entitlements.js';
 
 import dotenv from 'dotenv';
@@ -729,6 +729,44 @@ export const requireAuth = (allowedRoles?: UserRole[]) => {
 const app = express();
 app.use(express.json());
 
+// ---- HEALTH ----
+
+/**
+ * Liveness probe for the authentication dependency, intended for an external uptime monitor.
+ *
+ * Deliberately public and deliberately uninformative: the body is only {"status":"ok"} or
+ * {"status":"degraded"}. It never reveals the Supabase URL, hostname, project reference,
+ * key, DNS/error codes, stack traces, or environment metadata — all of that goes to the
+ * server log only, where an operator can already see it and an attacker cannot. Exposing
+ * the reason publicly would turn an uptime probe into a reconnaissance endpoint.
+ *
+ * It authenticates no one and sends no service-role key upstream (see checkAuthReachability).
+ * Results are cached briefly server-side so polling cannot be amplified into upstream load.
+ */
+app.get('/api/health/auth', async (_req, res) => {
+  // Must never be cached by a browser, CDN, or the service worker: a stale "ok" during a
+  // real outage is worse than no health check at all.
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+
+  const result = await checkAuthReachability();
+
+  if (!result.healthy) {
+    console.error(JSON.stringify({
+      event: 'AUTH_HEALTH_DEGRADED',
+      timestamp: new Date().toISOString(),
+      route: '/api/health/auth',
+      reason: result.reason,
+      cached: result.cached,
+      diagnostics: result.diagnostics,
+      env: process.env.VERCEL_ENV || process.env.NODE_ENV || 'unknown',
+      deploymentId: process.env.VERCEL_DEPLOYMENT_ID || undefined,
+      commit: process.env.VERCEL_GIT_COMMIT_SHA || undefined
+    }));
+    return res.status(503).json({ status: 'degraded' });
+  }
+  return res.status(200).json({ status: 'ok' });
+});
+
 // ---- AUTH ROUTES ----
 
 app.post('/api/auth/login', async (req, res) => {
@@ -921,8 +959,49 @@ app.get('/api/auth/me', async (req: any, res) => {
   if (!authHeader) return res.status(401).json({ status: 'unauthorized', error: 'No token' });
   const token = authHeader.toString().replace('Bearer ', '');
 
-  const { data: { user: authUser }, error } = await supabaseAdmin.auth.getUser(token);
-  if (error || !authUser) return res.status(401).json({ status: 'unauthorized', error: 'Session expired' });
+  // supabase-js swallows transport failures into `error`, so a backend outage is
+  // indistinguishable from a bad token unless we inspect the cause. Returning 401 for both
+  // is what made an outage log every user out: the client treats 401 as a definitive auth
+  // rejection and clears the stored token. Reachability is probed first so an unreachable
+  // backend yields 503 (session preserved) rather than 401 (session destroyed).
+  let authUser: any = null;
+  try {
+    const result = await supabaseAdmin.auth.getUser(token);
+    authUser = result.data?.user ?? null;
+    if (!authUser) {
+      const cause = (result.error as any)?.cause ?? result.error;
+      const looksTransport = !!cause && (
+        cause.name === 'AuthRetryableFetchError' ||
+        /fetch failed|ENOTFOUND|ETIMEDOUT|ECONNRESET|ECONNREFUSED|getaddrinfo/i.test(String(cause.message || ''))
+      );
+      if (looksTransport) {
+        const diag = classifyFetchError(cause);
+        console.error('[auth/me] backend unreachable', { ...diag, ...safeConfigDiagnostics() });
+        // supabase-js performs its own internal retries before surfacing
+        // AuthRetryableFetchError, so by this point the failure is already final.
+        logAuthUpstreamUnavailable({
+          route: '/api/auth/me', attempts: 1,
+          kind: diag.kind, code: diag.code, errorName: diag.errorName,
+          timedOut: diag.errorName === 'TimeoutError' || diag.code === 'ETIMEDOUT'
+        });
+        return res.status(503).json({
+          status: 'error',
+          error: `Session could not be verified: ${diag.detail}.`,
+          retryable: diag.kind === 'network'
+        });
+      }
+      return res.status(401).json({ status: 'unauthorized', error: 'Session expired' });
+    }
+  } catch (err: any) {
+    const diag = classifyFetchError(err);
+    console.error('[auth/me] threw', { ...diag, ...safeConfigDiagnostics() });
+    logAuthUpstreamUnavailable({
+      route: '/api/auth/me', attempts: 1,
+      kind: diag.kind, code: diag.code, errorName: diag.errorName,
+      timedOut: diag.errorName === 'TimeoutError' || diag.code === 'ETIMEDOUT'
+    });
+    return res.status(503).json({ status: 'error', error: `Session could not be verified: ${diag.detail}.`, retryable: diag.kind === 'network' });
+  }
 
   const profile = await getProfile(authUser.id);
   const user = toSaaSUser(authUser, profile);
