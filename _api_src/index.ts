@@ -15,6 +15,8 @@ import {
 import { LiveReportingService, invalidateWorkspaceCacheStore } from '../src/ghlService.js';
 import { supabaseAdmin, supabaseSignIn, classifyFetchError, safeConfigDiagnostics, checkAuthReachability, logAuthUpstreamUnavailable } from '../src/supabase.js';
 import { deriveEntitlement, newTrialWindow, type Entitlement } from '../src/entitlements.js';
+import { createTaskRouter } from '../src/tasks/router.js';
+import { closeActiveTimersForWorkspace } from '../src/tasks/entitlement.js';
 
 import dotenv from 'dotenv';
 dotenv.config();
@@ -589,7 +591,21 @@ function getMockGA4Report() {
 // AUTH MIDDLEWARE
 // ==========================================
 
-export const requireAuth = (allowedRoles?: UserRole[]) => {
+/**
+ * Options for requireAuth.
+ *
+ * entitlementMode defaults to 'enforce', so all 40+ existing call sites keep their exact
+ * current behaviour. 'defer' skips ONLY the entitlement denial (attaching req.entitlement for
+ * the caller to police itself) and is used solely by the Task Management module, which must
+ * let an expired tenant still read its data and stop a running timer (decision D4).
+ * Suspension, role checks and membership checks are unaffected in both modes.
+ */
+export interface RequireAuthOptions {
+  entitlementMode?: 'enforce' | 'defer';
+}
+
+export const requireAuth = (allowedRoles?: UserRole[], options: RequireAuthOptions = {}) => {
+  const entitlementMode = options.entitlementMode ?? 'enforce';
   return async (req: any, res: any, next: any) => {
     const authHeader = req.headers['x-auth-token'] || req.headers['authorization'];
     if (!authHeader) {
@@ -612,7 +628,7 @@ export const requireAuth = (allowedRoles?: UserRole[]) => {
       // it an expired tenant could keep full access simply by entering through the GHL
       // marketplace iframe instead of the login form.
       const ssoEntitlement = workspaceEntitlement(workspace);
-      if (!ssoEntitlement.hasAccess) {
+      if (entitlementMode === 'enforce' && !ssoEntitlement.hasAccess) {
         return res.status(403).json({
           status: 'error',
           error: ssoEntitlement.denialReason,
@@ -628,6 +644,11 @@ export const requireAuth = (allowedRoles?: UserRole[]) => {
       req.role = role;
       req.token = token;
       req.supabaseUserId = ssoPayload.userId || 'ghl_sso';
+      // Identity provenance for modules that need a verifiable actor. ssoUserId is the RAW
+      // signed value with no fallback: the Task Management module must be able to tell a
+      // verified SSO user from an anonymous one, which the 'ghl_sso' placeholder above hides.
+      req.authSource = 'ghl_sso';
+      req.ssoUserId = ssoPayload.userId || '';
       return next();
     }
 
@@ -700,7 +721,7 @@ export const requireAuth = (allowedRoles?: UserRole[]) => {
     const entitlement = workspaceEntitlement(workspace);
     req.entitlement = entitlement;
 
-    if (!entitlement.hasAccess && !isSuperAdmin) {
+    if (entitlementMode === 'enforce' && !entitlement.hasAccess && !isSuperAdmin) {
       return res.status(403).json({
         status: 'error',
         error: entitlement.denialReason,
@@ -718,6 +739,7 @@ export const requireAuth = (allowedRoles?: UserRole[]) => {
     req.role = role;
     req.token = token;
     req.supabaseUserId = authUser.id;
+    req.authSource = 'supabase';
     next();
   };
 };
@@ -766,6 +788,13 @@ app.get('/api/health/auth', async (_req, res) => {
   }
   return res.status(200).json({ status: 'ok' });
 });
+
+// ---- TASK MANAGEMENT ----
+// Mounted only here; server.ts deliberately does not serve this module (decision D2).
+// entitlementMode 'defer' hands the entitlement decision to the module so an expired tenant
+// can still read and stop a running timer (D4); every other route keeps 'enforce'.
+// Both feature flags default to false, so this is inert until explicitly enabled.
+app.use('/api/tasks', requireAuth(undefined, { entitlementMode: 'defer' }), createTaskRouter());
 
 // ---- AUTH ROUTES ----
 
@@ -1180,6 +1209,10 @@ app.post('/api/admin/suspend', requireAuth([UserRole.SUPER_ADMIN]), async (req: 
     suspension_reason: on ? (reason || null) : null
   }).eq('id', workspaceId);
 
+  // A suspended workspace must not leave timers accruing (D4). Non-fatal by design: the
+  // suspension itself has already been applied and must not be reported as failed.
+  if (on) await closeActiveTimersForWorkspace(workspaceId, 'workspace_suspended');
+
   await logAction(workspaceId, req.user.id, req.user.email, on ? 'SUSPEND_WORKSPACE' : 'RESTORE_WORKSPACE',
     on ? `Suspended. Reason: ${reason || 'not given'}` : 'Access restored.');
   res.json({ status: 'success', message: `Workspace "${ws.name}" has been ${on ? 'SUSPENDED' : 'RESTORED'}.` });
@@ -1302,6 +1335,9 @@ app.post('/api/admin/entitlement/revoke-license', requireAuth([UserRole.SUPER_AD
     license_status: 'REVOKED'
   }).eq('id', workspaceId);
   if (error) return res.status(500).json({ status: 'error', error: `Database error: ${error.message}` });
+
+  // Revoking a licence removes access, so any running timer is closed at a server cutoff (D4).
+  await closeActiveTimersForWorkspace(workspaceId, 'license_revoked');
 
   await logAction(workspaceId, req.user.id, req.user.email, 'REVOKE_LICENSE',
     `Licence revoked by ${req.user.email}. Reason: ${String(reason).trim()}`);

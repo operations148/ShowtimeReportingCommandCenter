@@ -14,7 +14,7 @@ This is a standalone SaaS reporting dashboard for service businesses using GoHig
 - Mock/live GHL-ready reporting architecture
 
 ## Dashboard Views
-Use these dashboard views only:
+Use these **reporting dashboard** views only:
 - Overview Dashboard
 - Opportunity Dashboard
 - Sales Dashboard
@@ -24,6 +24,17 @@ Use these dashboard views only:
 Do not create VA Dashboard.
 Do not create VA_USER role.
 Use User / Sales Rep instead of VA.
+
+### Scope of this restriction
+This restriction governs **reporting dashboards**. It means no additional reporting
+dashboard may be introduced beyond the five listed above.
+
+It does **not** prohibit the separately authorized **Task Management** module, which is a
+non-reporting operational feature with its own top-level navigation entry. Task Management
+is not a dashboard view and does not extend, replace, or alter the five reporting
+dashboards above.
+
+The prohibitions on a VA Dashboard and a VA_USER role remain in force and are unchanged.
 
 ## Security Rules
 - Never expose GHL tokens client-side

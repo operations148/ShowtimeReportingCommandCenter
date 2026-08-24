@@ -2428,7 +2428,7 @@ __export(index_exports, {
   requireAuth: () => requireAuth
 });
 module.exports = __toCommonJS(index_exports);
-var import_express = __toESM(require("express"));
+var import_express2 = __toESM(require("express"));
 var import_crypto = require("crypto");
 init_types();
 init_mockReportingData();
@@ -2779,6 +2779,862 @@ function newTrialWindow(now = Date.now()) {
     trialStartedAt: new Date(now).toISOString(),
     trialEndsAt: new Date(now + TRIAL_DURATION_DAYS * MS_PER_DAY).toISOString()
   };
+}
+
+// src/tasks/router.ts
+var import_express = __toESM(require("express"));
+
+// src/tasks/http.ts
+function applyNoStore(res) {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+}
+function ok(res, data, extra = {}) {
+  applyNoStore(res);
+  res.status(200).json({ status: "success", data, ...extra });
+}
+function fail(res, httpStatus, code, message, extra = {}) {
+  applyNoStore(res);
+  res.status(httpStatus).json({ status: "error", code, error: message, ...extra });
+}
+var TaskError = class extends Error {
+  constructor(httpStatus, code, message, extra = {}) {
+    super(message);
+    this.httpStatus = httpStatus;
+    this.code = code;
+    this.extra = extra;
+    this.name = "TaskError";
+  }
+};
+var notFound = (what = "Resource") => new TaskError(404, "TASK_NOT_FOUND", `${what} not found.`);
+var forbidden = (message = "You do not have permission to perform this action.") => new TaskError(403, "TASK_FORBIDDEN", message);
+var invalid = (message, extra = {}) => new TaskError(422, "TASK_VALIDATION_FAILED", message, extra);
+var versionConflict = () => new TaskError(
+  409,
+  "TASK_VERSION_CONFLICT",
+  "This record was modified by someone else. Reload and try again."
+);
+function handler(fn) {
+  return async (req, res) => {
+    try {
+      await fn(req, res);
+    } catch (err) {
+      if (err instanceof TaskError) {
+        return fail(res, err.httpStatus, err.code, err.message, err.extra);
+      }
+      const raw = String(err?.message || "");
+      if (raw.includes("TASK_NOT_FOUND")) {
+        return fail(res, 404, "TASK_NOT_FOUND", "Task not found.");
+      }
+      if (raw.includes("NO_ACTIVE_TIMER")) {
+        return fail(res, 404, "TASK_NO_ACTIVE_TIMER", "No running timer to stop.");
+      }
+      console.error("[tasks] unhandled error", {
+        route: req?.originalUrl,
+        method: req?.method,
+        message: raw
+      });
+      return fail(res, 500, "TASK_INTERNAL_ERROR", "An unexpected error occurred.");
+    }
+  };
+}
+function mapDbError(error, context) {
+  const code = error?.code || "";
+  if (code === "23503") return new TaskError(404, "TASK_NOT_FOUND", "Referenced record not found.");
+  if (code === "23505") return new TaskError(409, "TASK_VERSION_CONFLICT", "That record already exists.");
+  if (code === "23514") return new TaskError(422, "TASK_VALIDATION_FAILED", "A field failed validation.");
+  console.error(`[tasks] db error (${context})`, { code, message: error?.message });
+  return new TaskError(500, "TASK_INTERNAL_ERROR", "An unexpected error occurred.");
+}
+
+// src/tasks/config.ts
+function envFlag(name) {
+  const raw = (process.env[name] ?? "").trim().toLowerCase();
+  return raw === "true" || raw === "1" || raw === "yes" || raw === "on";
+}
+function isTaskManagementEnabled() {
+  return envFlag("TASK_MANAGEMENT_ENABLED");
+}
+function isTaskTimeTrackingEnabled() {
+  return isTaskManagementEnabled() && envFlag("TASK_TIME_TRACKING_ENABLED");
+}
+function supabaseIssuer() {
+  const raw = (process.env.SUPABASE_URL ?? "").trim();
+  try {
+    return raw ? new URL(raw).host : "supabase.unknown";
+  } catch {
+    return "supabase.unknown";
+  }
+}
+function ghlIssuer() {
+  const company = (process.env.GHL_COMPANY_ID ?? "").trim();
+  return company ? `gohighlevel:${company}` : "gohighlevel";
+}
+var DEFAULT_PAGE_SIZE = 50;
+var MAX_PAGE_SIZE = 200;
+
+// src/tasks/actors.ts
+function identityFromRequest(req) {
+  if (req.authSource === "ghl_sso") {
+    const externalId2 = String(req.ssoUserId ?? "").trim();
+    if (!externalId2) return null;
+    return { source: "ghl_sso", issuer: ghlIssuer(), externalId: externalId2 };
+  }
+  const externalId = String(req.supabaseUserId ?? "").trim();
+  if (!externalId) return null;
+  return { source: "supabase", issuer: supabaseIssuer(), externalId };
+}
+async function resolveActor(req) {
+  const identity = identityFromRequest(req);
+  if (!identity) return null;
+  const workspaceId = req.workspace.id;
+  const { data: principal, error: pErr } = await supabaseAdmin.from("task_principals").upsert(
+    { source: identity.source, issuer: identity.issuer, external_id: identity.externalId },
+    { onConflict: "source,issuer,external_id" }
+  ).select("id").single();
+  if (pErr || !principal) throw mapDbError(pErr, "resolve principal");
+  const displayName = typeof req.user?.name === "string" ? req.user.name.slice(0, 200) : null;
+  const email = typeof req.user?.email === "string" ? req.user.email.slice(0, 320) : null;
+  const { data: actor, error: aErr } = await supabaseAdmin.from("task_workspace_actors").upsert(
+    {
+      workspace_id: workspaceId,
+      principal_id: principal.id,
+      display_name: displayName,
+      email,
+      last_seen_at: (/* @__PURE__ */ new Date()).toISOString()
+    },
+    { onConflict: "workspace_id,principal_id" }
+  ).select("id").single();
+  if (aErr || !actor) throw mapDbError(aErr, "resolve workspace actor");
+  return { principalId: principal.id, actorId: actor.id, source: identity.source };
+}
+function requireResolvedActor(actor) {
+  if (!actor) {
+    throw new TaskError(
+      403,
+      "TASK_ACTOR_UNRESOLVED",
+      "Your session has no verified user identity, so it cannot create or modify task data. Sign in again from GoHighLevel, or contact your administrator."
+    );
+  }
+  return actor;
+}
+
+// src/tasks/entitlement.ts
+init_types();
+function assertTaskEntitlement(entitlement, role, operation) {
+  if (role === "SUPER_ADMIN" /* SUPER_ADMIN */) return;
+  if (!entitlement) {
+    throw new TaskError(
+      403,
+      "TASK_ENTITLEMENT_EXPIRED",
+      "This workspace does not currently have access to Task Management."
+    );
+  }
+  if (entitlement.accessStatus === "SUSPENDED") {
+    throw new TaskError(
+      403,
+      "TASK_WORKSPACE_SUSPENDED",
+      entitlement.denialReason || "This workspace has been suspended.",
+      { accessDenied: true, suspended: true }
+    );
+  }
+  if (entitlement.hasAccess) return;
+  if (operation === "read" || operation === "timer.stop") return;
+  throw new TaskError(
+    403,
+    "TASK_ENTITLEMENT_EXPIRED",
+    entitlement.denialReason || "Your trial has ended. Task data remains readable, but changes require full access.",
+    { accessDenied: true }
+  );
+}
+async function closeActiveTimersForWorkspace(workspaceId, reason) {
+  try {
+    const { data, error } = await supabaseAdmin.rpc("task_close_active_timers", {
+      p_workspace_id: workspaceId,
+      p_reason: reason
+    });
+    if (error) {
+      console.error("[tasks] failed to close active timers", {
+        workspaceId,
+        reason,
+        code: error.code
+      });
+      return 0;
+    }
+    const closed = typeof data === "number" ? data : 0;
+    if (closed > 0) {
+      console.warn("[tasks] auto-closed running timers", { workspaceId, reason, closed });
+    }
+    return closed;
+  } catch (err) {
+    console.error("[tasks] closeActiveTimersForWorkspace threw", {
+      workspaceId,
+      reason,
+      message: err?.message
+    });
+    return 0;
+  }
+}
+
+// src/tasks/permissions.ts
+init_types();
+var MANAGER_ROLES = [
+  "SUPER_ADMIN" /* SUPER_ADMIN */,
+  "WORKSPACE_OWNER" /* WORKSPACE_OWNER */,
+  "ADMIN" /* ADMIN */
+];
+var CONTRIBUTOR_ROLES = [
+  "SALES_REP" /* SALES_REP */,
+  "TEAM_MEMBER" /* TEAM_MEMBER */
+];
+var isManager = (role) => MANAGER_ROLES.includes(role);
+var isContributor = (role) => CONTRIBUTOR_ROLES.includes(role);
+function assertCanManageHierarchy(role) {
+  if (!isManager(role)) {
+    throw forbidden("Only workspace administrators can manage Spaces, Lists and statuses.");
+  }
+}
+function assertCanCreateTask(role) {
+  if (!isManager(role) && !isContributor(role)) {
+    throw forbidden("You do not have permission to create tasks.");
+  }
+}
+function assertCanMutateTask(role, actorId, task, assigneeActorIds) {
+  if (isManager(role)) return;
+  if (!isContributor(role)) {
+    throw forbidden("You do not have permission to modify tasks.");
+  }
+  const isCreator = task.created_by === actorId;
+  const isAssignee = assigneeActorIds.includes(actorId);
+  if (!isCreator && !isAssignee) {
+    throw forbidden("You can only modify tasks you created or are assigned to.");
+  }
+}
+function assertCanApplyAssignments(role, actorId, currentAssignees, nextAssignees) {
+  if (isManager(role)) return;
+  if (!isContributor(role)) {
+    throw forbidden("You do not have permission to change assignments.");
+  }
+  const added = nextAssignees.filter((id) => !currentAssignees.includes(id));
+  const removed = currentAssignees.filter((id) => !nextAssignees.includes(id));
+  const touchesOthers = [...added, ...removed].some((id) => id !== actorId);
+  if (touchesOthers) {
+    throw forbidden("You can only assign or unassign yourself.");
+  }
+}
+function assertCanMutateTimeEntry(role, actorId, entry) {
+  if (isManager(role)) return;
+  if (!isContributor(role)) {
+    throw forbidden("You do not have permission to record time.");
+  }
+  if (entry.actor_id !== actorId) {
+    throw forbidden("You can only manage your own time entries.");
+  }
+}
+function assertCanTrackTime(role) {
+  if (!isManager(role) && !isContributor(role)) {
+    throw forbidden("Your role cannot record time.");
+  }
+}
+function timeVisibilityFor(role) {
+  if (isManager(role)) return "team";
+  if (isContributor(role)) return "own";
+  return "aggregate_only";
+}
+
+// src/tasks/validation.ts
+var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+var PRIORITIES = ["urgent", "high", "normal", "low"];
+var STATUS_CATEGORIES = ["todo", "in_progress", "done"];
+function requireUuid(value, field) {
+  if (typeof value !== "string" || !UUID_RE.test(value)) {
+    throw invalid(`${field} must be a valid identifier.`);
+  }
+  return value;
+}
+function optionalUuid(value, field) {
+  if (value === void 0 || value === null || value === "") return null;
+  return requireUuid(value, field);
+}
+function requireString(value, field, min, max) {
+  if (typeof value !== "string") throw invalid(`${field} is required.`);
+  const trimmed = value.trim();
+  if (trimmed.length < min) throw invalid(`${field} must be at least ${min} character(s).`);
+  if (trimmed.length > max) throw invalid(`${field} must be at most ${max} characters.`);
+  return trimmed;
+}
+function optionalString(value, field, max) {
+  if (value === void 0 || value === null) return null;
+  if (typeof value !== "string") throw invalid(`${field} must be text.`);
+  const trimmed = value.trim();
+  if (trimmed === "") return null;
+  if (trimmed.length > max) throw invalid(`${field} must be at most ${max} characters.`);
+  return trimmed;
+}
+function requireEnum(value, field, allowed) {
+  if (typeof value !== "string" || !allowed.includes(value)) {
+    throw invalid(`${field} must be one of: ${allowed.join(", ")}.`);
+  }
+  return value;
+}
+function optionalEnum(value, field, allowed) {
+  if (value === void 0 || value === null || value === "") return null;
+  return requireEnum(value, field, allowed);
+}
+function optionalTimestamp(value, field) {
+  if (value === void 0 || value === null || value === "") return null;
+  if (typeof value !== "string") throw invalid(`${field} must be an ISO-8601 timestamp.`);
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) throw invalid(`${field} must be a valid ISO-8601 timestamp.`);
+  return new Date(ms).toISOString();
+}
+function optionalNonNegativeInt(value, field, max) {
+  if (value === void 0 || value === null || value === "") return null;
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(n) || n < 0 || n > max) {
+    throw invalid(`${field} must be a whole number between 0 and ${max}.`);
+  }
+  return n;
+}
+function requireVersion(value) {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(n) || n < 1) {
+    throw invalid("A valid `version` is required for updates. Reload the record and retry.");
+  }
+  return n;
+}
+function parsePagination(query) {
+  const rawPage = Number(query?.page ?? 1);
+  const rawSize = Number(query?.pageSize ?? DEFAULT_PAGE_SIZE);
+  const page = Number.isInteger(rawPage) && rawPage > 0 ? rawPage : 1;
+  const pageSize = Number.isInteger(rawSize) && rawSize > 0 ? Math.min(rawSize, MAX_PAGE_SIZE) : DEFAULT_PAGE_SIZE;
+  return { page, pageSize, offset: (page - 1) * pageSize };
+}
+var SORTABLE = ["position", "due_date", "updated_at", "created_at", "priority", "title"];
+function parseSort(query) {
+  const raw = String(query?.sort ?? "position");
+  const desc = raw.startsWith("-");
+  const column = desc ? raw.slice(1) : raw;
+  if (!SORTABLE.includes(column)) {
+    throw invalid(`sort must be one of: ${SORTABLE.join(", ")} (optionally prefixed with '-').`);
+  }
+  return { column, ascending: !desc };
+}
+function rejectClientWorkspaceId(body, query) {
+  const present = (o) => o && typeof o === "object" && ("workspace_id" in o || "workspaceId" in o);
+  if (present(body) || present(query)) {
+    throw invalid("workspace_id is derived from your session and must not be supplied.");
+  }
+}
+
+// src/tasks/router.ts
+var TASK_COLUMNS = "id, list_id, status_id, parent_task_id, title, description, priority, start_date, due_date, time_estimate_seconds, position, version, archived_at, created_by, updated_by, created_at, updated_at";
+function guard(operation, fn, opts = {}) {
+  return handler(async (req, res) => {
+    if (!isTaskManagementEnabled()) {
+      throw new TaskError(403, "TASK_MODULE_DISABLED", "Task Management is not enabled.");
+    }
+    if (opts.requiresTimeTracking && !isTaskTimeTrackingEnabled()) {
+      throw new TaskError(403, "TASK_TIME_TRACKING_DISABLED", "Time tracking is not enabled.");
+    }
+    rejectClientWorkspaceId(req.body, req.query);
+    assertTaskEntitlement(req.entitlement, req.role, operation);
+    if (req.entitlement && !req.entitlement.hasAccess && req.entitlement.accessStatus !== "SUSPENDED") {
+      await closeActiveTimersForWorkspace(req.workspace.id, "entitlement_expired");
+    }
+    const actor = await resolveActor(req);
+    if (operation !== "read") requireResolvedActor(actor);
+    await fn(req, res, { workspaceId: req.workspace.id, role: req.role, actor });
+  });
+}
+async function recordActivity(ctx, entityType, entityId, action, detail = {}) {
+  try {
+    await supabaseAdmin.from("task_activity_events").insert({
+      workspace_id: ctx.workspaceId,
+      actor_id: ctx.actor?.actorId ?? null,
+      entity_type: entityType,
+      entity_id: entityId,
+      action,
+      detail
+    });
+  } catch (err) {
+    console.error("[tasks] activity write failed", { action, message: err?.message });
+  }
+}
+async function loadTask(ctx, taskId) {
+  const { data, error } = await supabaseAdmin.from("task_items").select(TASK_COLUMNS).eq("workspace_id", ctx.workspaceId).eq("id", taskId).maybeSingle();
+  if (error) throw mapDbError(error, "load task");
+  if (!data) throw notFound("Task");
+  return data;
+}
+async function loadAssigneeIds(ctx, taskId) {
+  const { data, error } = await supabaseAdmin.from("task_assignments").select("actor_id").eq("workspace_id", ctx.workspaceId).eq("task_id", taskId);
+  if (error) throw mapDbError(error, "load assignees");
+  return (data || []).map((r) => r.actor_id);
+}
+function createTaskRouter() {
+  const router = import_express.default.Router();
+  router.use((_req, res, next) => {
+    applyNoStore(res);
+    next();
+  });
+  router.get("/bootstrap", guard("read", async (_req, res, ctx) => {
+    const [spaces, lists, statuses] = await Promise.all([
+      supabaseAdmin.from("task_spaces").select("id, name, position, version, archived_at").eq("workspace_id", ctx.workspaceId).order("position"),
+      supabaseAdmin.from("task_lists").select("id, space_id, name, position, is_default, version, archived_at").eq("workspace_id", ctx.workspaceId).order("position"),
+      supabaseAdmin.from("task_statuses").select("id, space_id, name, category, color, position, is_default, version, archived_at").eq("workspace_id", ctx.workspaceId).order("position")
+    ]);
+    for (const r of [spaces, lists, statuses]) {
+      if (r.error) throw mapDbError(r.error, "bootstrap");
+    }
+    let activeTimer = null;
+    if (isTaskTimeTrackingEnabled() && ctx.actor) {
+      const { data } = await supabaseAdmin.from("task_time_entries").select("id, task_id, started_at").eq("principal_id", ctx.actor.principalId).is("ended_at", null).maybeSingle();
+      activeTimer = data ?? null;
+    }
+    ok(res, {
+      spaces: spaces.data ?? [],
+      lists: lists.data ?? [],
+      statuses: statuses.data ?? [],
+      activeTimer,
+      capabilities: {
+        canManageHierarchy: isManager(ctx.role),
+        canCreateTask: isManager(ctx.role) || isContributor(ctx.role),
+        canAssignOthers: isManager(ctx.role),
+        timeVisibility: timeVisibilityFor(ctx.role),
+        timeTrackingEnabled: isTaskTimeTrackingEnabled(),
+        actorResolved: ctx.actor !== null
+      }
+    });
+  }));
+  router.post("/spaces", guard("mutate", async (req, res, ctx) => {
+    assertCanManageHierarchy(ctx.role);
+    const name = requireString(req.body?.name, "name", 1, 120);
+    const actor = requireResolvedActor(ctx.actor);
+    const { data, error } = await supabaseAdmin.rpc("task_create_space", {
+      p_workspace_id: ctx.workspaceId,
+      p_name: name,
+      p_actor_id: actor.actorId
+    });
+    if (error) throw mapDbError(error, "create space");
+    const row = Array.isArray(data) ? data[0] : data;
+    await recordActivity(ctx, "space", row.space_id, "SPACE_CREATED", { name });
+    ok(res, { spaceId: row.space_id, defaultListId: row.list_id });
+  }));
+  router.patch("/spaces/:id", guard("mutate", async (req, res, ctx) => {
+    assertCanManageHierarchy(ctx.role);
+    const id = requireUuid(req.params.id, "id");
+    const version = requireVersion(req.body?.version);
+    const actor = requireResolvedActor(ctx.actor);
+    const patch = { updated_by: actor.actorId, version: version + 1 };
+    if (req.body?.name !== void 0) patch.name = requireString(req.body.name, "name", 1, 120);
+    if (req.body?.position !== void 0) patch.position = Number(req.body.position);
+    if (req.body?.archived === true) patch.archived_at = (/* @__PURE__ */ new Date()).toISOString();
+    if (req.body?.archived === false) patch.archived_at = null;
+    const { data, error } = await supabaseAdmin.from("task_spaces").update(patch).eq("workspace_id", ctx.workspaceId).eq("id", id).eq("version", version).select("id, name, position, version, archived_at");
+    if (error) throw mapDbError(error, "update space");
+    if (!data || data.length === 0) {
+      const { data: exists } = await supabaseAdmin.from("task_spaces").select("id").eq("workspace_id", ctx.workspaceId).eq("id", id).maybeSingle();
+      throw exists ? versionConflict() : notFound("Space");
+    }
+    await recordActivity(ctx, "space", id, "SPACE_UPDATED");
+    ok(res, data[0]);
+  }));
+  router.post("/lists", guard("mutate", async (req, res, ctx) => {
+    assertCanManageHierarchy(ctx.role);
+    const spaceId = requireUuid(req.body?.spaceId, "spaceId");
+    const name = requireString(req.body?.name, "name", 1, 120);
+    const actor = requireResolvedActor(ctx.actor);
+    const { data, error } = await supabaseAdmin.from("task_lists").insert({
+      workspace_id: ctx.workspaceId,
+      space_id: spaceId,
+      name,
+      position: Number(req.body?.position ?? 1e3),
+      created_by: actor.actorId,
+      updated_by: actor.actorId
+    }).select("id, space_id, name, position, is_default, version, archived_at").single();
+    if (error) throw mapDbError(error, "create list");
+    await recordActivity(ctx, "list", data.id, "LIST_CREATED", { name });
+    ok(res, data);
+  }));
+  router.patch("/lists/:id", guard("mutate", async (req, res, ctx) => {
+    assertCanManageHierarchy(ctx.role);
+    const id = requireUuid(req.params.id, "id");
+    const version = requireVersion(req.body?.version);
+    const actor = requireResolvedActor(ctx.actor);
+    const patch = { updated_by: actor.actorId, version: version + 1 };
+    if (req.body?.name !== void 0) patch.name = requireString(req.body.name, "name", 1, 120);
+    if (req.body?.position !== void 0) patch.position = Number(req.body.position);
+    if (req.body?.archived === true) patch.archived_at = (/* @__PURE__ */ new Date()).toISOString();
+    if (req.body?.archived === false) patch.archived_at = null;
+    const { data, error } = await supabaseAdmin.from("task_lists").update(patch).eq("workspace_id", ctx.workspaceId).eq("id", id).eq("version", version).select("id, space_id, name, position, is_default, version, archived_at");
+    if (error) throw mapDbError(error, "update list");
+    if (!data || data.length === 0) {
+      const { data: exists } = await supabaseAdmin.from("task_lists").select("id").eq("workspace_id", ctx.workspaceId).eq("id", id).maybeSingle();
+      throw exists ? versionConflict() : notFound("List");
+    }
+    await recordActivity(ctx, "list", id, "LIST_UPDATED");
+    ok(res, data[0]);
+  }));
+  router.get("/statuses", guard("read", async (req, res, ctx) => {
+    const spaceId = requireUuid(req.query?.spaceId, "spaceId");
+    const { data, error } = await supabaseAdmin.from("task_statuses").select("id, space_id, name, category, color, position, is_default, version, archived_at").eq("workspace_id", ctx.workspaceId).eq("space_id", spaceId).order("position");
+    if (error) throw mapDbError(error, "list statuses");
+    ok(res, data ?? []);
+  }));
+  router.post("/statuses", guard("mutate", async (req, res, ctx) => {
+    assertCanManageHierarchy(ctx.role);
+    const spaceId = requireUuid(req.body?.spaceId, "spaceId");
+    const name = requireString(req.body?.name, "name", 1, 60);
+    const category = requireEnum(req.body?.category, "category", STATUS_CATEGORIES);
+    const color = optionalString(req.body?.color, "color", 7);
+    const { data, error } = await supabaseAdmin.from("task_statuses").insert({
+      workspace_id: ctx.workspaceId,
+      space_id: spaceId,
+      name,
+      category,
+      color,
+      position: Number(req.body?.position ?? 1e3)
+    }).select("id, space_id, name, category, color, position, is_default, version").single();
+    if (error) throw mapDbError(error, "create status");
+    await recordActivity(ctx, "status", data.id, "STATUS_CREATED", { name, category });
+    ok(res, data);
+  }));
+  router.patch("/statuses/:id", guard("mutate", async (req, res, ctx) => {
+    assertCanManageHierarchy(ctx.role);
+    const id = requireUuid(req.params.id, "id");
+    const version = requireVersion(req.body?.version);
+    const patch = { version: version + 1 };
+    if (req.body?.name !== void 0) patch.name = requireString(req.body.name, "name", 1, 60);
+    if (req.body?.category !== void 0) {
+      patch.category = requireEnum(req.body.category, "category", STATUS_CATEGORIES);
+    }
+    if (req.body?.position !== void 0) patch.position = Number(req.body.position);
+    if (req.body?.archived === true) patch.archived_at = (/* @__PURE__ */ new Date()).toISOString();
+    if (req.body?.archived === false) patch.archived_at = null;
+    const { data, error } = await supabaseAdmin.from("task_statuses").update(patch).eq("workspace_id", ctx.workspaceId).eq("id", id).eq("version", version).select("id, space_id, name, category, color, position, version, archived_at");
+    if (error) throw mapDbError(error, "update status");
+    if (!data || data.length === 0) {
+      const { data: exists } = await supabaseAdmin.from("task_statuses").select("id").eq("workspace_id", ctx.workspaceId).eq("id", id).maybeSingle();
+      throw exists ? versionConflict() : notFound("Status");
+    }
+    ok(res, data[0]);
+  }));
+  router.get("/timer/active", guard("read", async (_req, res, ctx) => {
+    if (!isTaskTimeTrackingEnabled()) return ok(res, { activeTimer: null });
+    if (!ctx.actor) return ok(res, { activeTimer: null });
+    const { data, error } = await supabaseAdmin.from("task_time_entries").select("id, task_id, workspace_id, started_at").eq("principal_id", ctx.actor.principalId).is("ended_at", null).maybeSingle();
+    if (error) throw mapDbError(error, "active timer");
+    ok(res, { activeTimer: data ?? null, serverTime: (/* @__PURE__ */ new Date()).toISOString() });
+  }));
+  router.post("/timer/start", guard("mutate", async (req, res, ctx) => {
+    assertCanTrackTime(ctx.role);
+    const actor = requireResolvedActor(ctx.actor);
+    const taskId = requireUuid(req.body?.taskId, "taskId");
+    const clientToken = optionalUuid(req.body?.clientToken, "clientToken");
+    const { data, error } = await supabaseAdmin.rpc("task_timer_start", {
+      p_workspace_id: ctx.workspaceId,
+      p_task_id: taskId,
+      p_principal_id: actor.principalId,
+      p_actor_id: actor.actorId,
+      p_client_token: clientToken
+    });
+    if (error) throw mapDbError(error, "timer start");
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) throw notFound("Task");
+    if (row.outcome === "conflict_other_task") {
+      return fail(
+        res,
+        409,
+        "TASK_TIMER_CONFLICT",
+        "A timer is already running on a different task.",
+        {
+          data: { entryId: row.entry_id, taskId: row.task_id, startedAt: row.started_at },
+          serverTime: (/* @__PURE__ */ new Date()).toISOString()
+        }
+      );
+    }
+    if (row.outcome === "started") {
+      await recordActivity(ctx, "time_entry", row.entry_id, "TIMER_STARTED", { taskId });
+    }
+    ok(res, {
+      entryId: row.entry_id,
+      taskId: row.task_id,
+      startedAt: row.started_at,
+      outcome: row.outcome,
+      serverTime: (/* @__PURE__ */ new Date()).toISOString()
+    });
+  }, { requiresTimeTracking: true }));
+  router.post("/timer/stop", guard("timer.stop", async (req, res, ctx) => {
+    assertCanTrackTime(ctx.role);
+    const actor = requireResolvedActor(ctx.actor);
+    const entryId = optionalUuid(req.body?.entryId, "entryId");
+    const { data, error } = await supabaseAdmin.rpc("task_timer_stop", {
+      p_workspace_id: ctx.workspaceId,
+      p_principal_id: actor.principalId,
+      p_entry_id: entryId
+    });
+    if (error) throw mapDbError(error, "timer stop");
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) throw new TaskError(404, "TASK_NO_ACTIVE_TIMER", "No running timer to stop.");
+    if (row.outcome === "stopped") {
+      await recordActivity(
+        ctx,
+        "time_entry",
+        row.entry_id,
+        "TIMER_STOPPED",
+        { taskId: row.task_id, durationSeconds: row.duration_seconds }
+      );
+    }
+    ok(res, {
+      entryId: row.entry_id,
+      taskId: row.task_id,
+      startedAt: row.started_at,
+      endedAt: row.ended_at,
+      durationSeconds: Number(row.duration_seconds ?? 0),
+      outcome: row.outcome
+    });
+  }, { requiresTimeTracking: true }));
+  router.post("/time-entries", guard("mutate", async (req, res, ctx) => {
+    assertCanTrackTime(ctx.role);
+    const actor = requireResolvedActor(ctx.actor);
+    const taskId = requireUuid(req.body?.taskId, "taskId");
+    const startedAt = optionalTimestamp(req.body?.startedAt, "startedAt");
+    const endedAt = optionalTimestamp(req.body?.endedAt, "endedAt");
+    const note = optionalString(req.body?.note, "note", 2e3);
+    if (!startedAt || !endedAt) throw invalid("Manual entries require startedAt and endedAt.");
+    if (Date.parse(endedAt) <= Date.parse(startedAt)) {
+      throw invalid("endedAt must be after startedAt.");
+    }
+    const { data, error } = await supabaseAdmin.from("task_time_entries").insert({
+      workspace_id: ctx.workspaceId,
+      task_id: taskId,
+      principal_id: actor.principalId,
+      actor_id: actor.actorId,
+      started_at: startedAt,
+      ended_at: endedAt,
+      source: "manual",
+      note
+    }).select("id, task_id, actor_id, started_at, ended_at, source, note").single();
+    if (error) throw mapDbError(error, "create manual entry");
+    await recordActivity(ctx, "time_entry", data.id, "MANUAL_TIME_ADDED", { taskId });
+    ok(res, data);
+  }, { requiresTimeTracking: true }));
+  router.patch("/time-entries/:id", guard("mutate", async (req, res, ctx) => {
+    const actor = requireResolvedActor(ctx.actor);
+    const id = requireUuid(req.params.id, "id");
+    const { data: entry, error: loadErr } = await supabaseAdmin.from("task_time_entries").select("id, actor_id, started_at, ended_at, source").eq("workspace_id", ctx.workspaceId).eq("id", id).maybeSingle();
+    if (loadErr) throw mapDbError(loadErr, "load time entry");
+    if (!entry) throw notFound("Time entry");
+    assertCanMutateTimeEntry(ctx.role, actor.actorId, entry);
+    const patch = {};
+    if (req.body?.note !== void 0) patch.note = optionalString(req.body.note, "note", 2e3);
+    if (req.body?.startedAt !== void 0) {
+      patch.started_at = optionalTimestamp(req.body.startedAt, "startedAt");
+    }
+    if (req.body?.endedAt !== void 0) {
+      patch.ended_at = optionalTimestamp(req.body.endedAt, "endedAt");
+    }
+    if (req.body?.archived === true) patch.archived_at = (/* @__PURE__ */ new Date()).toISOString();
+    if (req.body?.archived === false) patch.archived_at = null;
+    if (Object.keys(patch).length === 0) throw invalid("No supported fields supplied.");
+    const { data, error } = await supabaseAdmin.from("task_time_entries").update(patch).eq("workspace_id", ctx.workspaceId).eq("id", id).select("id, task_id, actor_id, started_at, ended_at, source, note, archived_at").single();
+    if (error) throw mapDbError(error, "update time entry");
+    await recordActivity(ctx, "time_entry", id, "TIME_ENTRY_UPDATED");
+    ok(res, data);
+  }, { requiresTimeTracking: true }));
+  router.get("/time/summary", guard("read", async (req, res, ctx) => {
+    const visibility = timeVisibilityFor(ctx.role);
+    const taskId = optionalUuid(req.query?.taskId, "taskId");
+    let q = supabaseAdmin.from("task_time_entries").select("task_id, actor_id, started_at, ended_at").eq("workspace_id", ctx.workspaceId).is("archived_at", null);
+    if (taskId) q = q.eq("task_id", taskId);
+    if (visibility === "own" && ctx.actor) q = q.eq("actor_id", ctx.actor.actorId);
+    if (visibility === "own" && !ctx.actor) return ok(res, { byTask: [], byMember: [] });
+    const { data, error } = await q;
+    if (error) throw mapDbError(error, "time summary");
+    const now = Date.now();
+    const seconds = (r) => Math.max(0, Math.floor(((r.ended_at ? Date.parse(r.ended_at) : now) - Date.parse(r.started_at)) / 1e3));
+    const byTask = /* @__PURE__ */ new Map();
+    const byMember = /* @__PURE__ */ new Map();
+    for (const r of data ?? []) {
+      byTask.set(r.task_id, (byTask.get(r.task_id) ?? 0) + seconds(r));
+      byMember.set(r.actor_id, (byMember.get(r.actor_id) ?? 0) + seconds(r));
+    }
+    ok(res, {
+      byTask: [...byTask].map(([id, s]) => ({ taskId: id, trackedSeconds: s })),
+      // READ_ONLY receives task-level aggregate only — never per-person rows or identities.
+      byMember: visibility === "aggregate_only" ? [] : [...byMember].map(([id, s]) => ({ actorId: id, trackedSeconds: s })),
+      visibility
+    });
+  }, { requiresTimeTracking: true }));
+  router.get("/", guard("read", async (req, res, ctx) => {
+    const { page, pageSize, offset } = parsePagination(req.query);
+    const { column, ascending } = parseSort(req.query);
+    let q = supabaseAdmin.from("task_items").select(TASK_COLUMNS, { count: "exact" }).eq("workspace_id", ctx.workspaceId);
+    const listId = optionalUuid(req.query?.listId, "listId");
+    const statusId = optionalUuid(req.query?.statusId, "statusId");
+    const parentId = optionalUuid(req.query?.parentTaskId, "parentTaskId");
+    const priority = optionalEnum(req.query?.priority, "priority", PRIORITIES);
+    const search = optionalString(req.query?.q, "q", 200);
+    if (listId) q = q.eq("list_id", listId);
+    if (statusId) q = q.eq("status_id", statusId);
+    if (priority) q = q.eq("priority", priority);
+    if (parentId) q = q.eq("parent_task_id", parentId);
+    if (req.query?.rootOnly === "true") q = q.is("parent_task_id", null);
+    if (req.query?.includeArchived !== "true") q = q.is("archived_at", null);
+    if (search) q = q.ilike("title", `%${search.replace(/[%_]/g, "\\$&")}%`);
+    if (req.query?.dueBefore) {
+      q = q.lte("due_date", optionalTimestamp(req.query.dueBefore, "dueBefore"));
+    }
+    const { data, error, count } = await q.order(column, { ascending }).range(offset, offset + pageSize - 1);
+    if (error) throw mapDbError(error, "list tasks");
+    const ids = (data ?? []).map((t) => t.id);
+    let assignments = [];
+    if (ids.length) {
+      const { data: a, error: aErr } = await supabaseAdmin.from("task_assignments").select("task_id, actor_id").eq("workspace_id", ctx.workspaceId).in("task_id", ids);
+      if (aErr) throw mapDbError(aErr, "list assignments");
+      assignments = a ?? [];
+    }
+    const byTask = /* @__PURE__ */ new Map();
+    for (const a of assignments) {
+      byTask.set(a.task_id, [...byTask.get(a.task_id) ?? [], a.actor_id]);
+    }
+    ok(
+      res,
+      (data ?? []).map((t) => ({ ...t, assigneeActorIds: byTask.get(t.id) ?? [] })),
+      { page: { page, pageSize, total: count ?? 0 } }
+    );
+  }));
+  router.post("/", guard("mutate", async (req, res, ctx) => {
+    assertCanCreateTask(ctx.role);
+    const actor = requireResolvedActor(ctx.actor);
+    const listId = requireUuid(req.body?.listId, "listId");
+    const statusId = requireUuid(req.body?.statusId, "statusId");
+    const title = requireString(req.body?.title, "title", 1, 500);
+    const parentTaskId = optionalUuid(req.body?.parentTaskId, "parentTaskId");
+    const startDate = optionalTimestamp(req.body?.startDate, "startDate");
+    const dueDate = optionalTimestamp(req.body?.dueDate, "dueDate");
+    if (startDate && dueDate && Date.parse(dueDate) < Date.parse(startDate)) {
+      throw invalid("dueDate cannot be earlier than startDate.");
+    }
+    const { data, error } = await supabaseAdmin.from("task_items").insert({
+      workspace_id: ctx.workspaceId,
+      list_id: listId,
+      status_id: statusId,
+      parent_task_id: parentTaskId,
+      title,
+      description: optionalString(req.body?.description, "description", 2e4),
+      priority: optionalEnum(req.body?.priority, "priority", PRIORITIES) ?? "normal",
+      start_date: startDate,
+      due_date: dueDate,
+      time_estimate_seconds: optionalNonNegativeInt(req.body?.timeEstimateSeconds, "timeEstimateSeconds", 31536e5),
+      position: Number(req.body?.position ?? 1e3),
+      created_by: actor.actorId,
+      updated_by: actor.actorId
+    }).select(TASK_COLUMNS).single();
+    if (error) throw mapDbError(error, "create task");
+    await recordActivity(ctx, "task", data.id, "TASK_CREATED", { title });
+    ok(res, { ...data, assigneeActorIds: [] });
+  }));
+  router.get("/:id", guard("read", async (req, res, ctx) => {
+    const id = requireUuid(req.params.id, "id");
+    const task = await loadTask(ctx, id);
+    const [assignees, subtasks] = await Promise.all([
+      loadAssigneeIds(ctx, id),
+      supabaseAdmin.from("task_items").select(TASK_COLUMNS).eq("workspace_id", ctx.workspaceId).eq("parent_task_id", id).order("position")
+    ]);
+    ok(res, { ...task, assigneeActorIds: assignees, subtasks: subtasks.data ?? [] });
+  }));
+  router.patch("/:id", guard("mutate", async (req, res, ctx) => {
+    const actor = requireResolvedActor(ctx.actor);
+    const id = requireUuid(req.params.id, "id");
+    const version = requireVersion(req.body?.version);
+    const task = await loadTask(ctx, id);
+    const assignees = await loadAssigneeIds(ctx, id);
+    assertCanMutateTask(ctx.role, actor.actorId, task, assignees);
+    const patch = { updated_by: actor.actorId, version: version + 1 };
+    if (req.body?.title !== void 0) patch.title = requireString(req.body.title, "title", 1, 500);
+    if (req.body?.description !== void 0) {
+      patch.description = optionalString(req.body.description, "description", 2e4);
+    }
+    if (req.body?.statusId !== void 0) patch.status_id = requireUuid(req.body.statusId, "statusId");
+    if (req.body?.listId !== void 0) patch.list_id = requireUuid(req.body.listId, "listId");
+    if (req.body?.priority !== void 0) {
+      patch.priority = requireEnum(req.body.priority, "priority", PRIORITIES);
+    }
+    if (req.body?.startDate !== void 0) {
+      patch.start_date = optionalTimestamp(req.body.startDate, "startDate");
+    }
+    if (req.body?.dueDate !== void 0) {
+      patch.due_date = optionalTimestamp(req.body.dueDate, "dueDate");
+    }
+    if (req.body?.timeEstimateSeconds !== void 0) {
+      patch.time_estimate_seconds = optionalNonNegativeInt(req.body.timeEstimateSeconds, "timeEstimateSeconds", 31536e5);
+    }
+    if (req.body?.position !== void 0) patch.position = Number(req.body.position);
+    const { data, error } = await supabaseAdmin.from("task_items").update(patch).eq("workspace_id", ctx.workspaceId).eq("id", id).eq("version", version).select(TASK_COLUMNS);
+    if (error) throw mapDbError(error, "update task");
+    if (!data || data.length === 0) throw versionConflict();
+    await recordActivity(ctx, "task", id, "TASK_UPDATED");
+    ok(res, data[0]);
+  }));
+  for (const [suffix, archived] of [["archive", true], ["restore", false]]) {
+    router.post(`/:id/${suffix}`, guard("mutate", async (req, res, ctx) => {
+      const actor = requireResolvedActor(ctx.actor);
+      const id = requireUuid(req.params.id, "id");
+      const version = requireVersion(req.body?.version);
+      const task = await loadTask(ctx, id);
+      assertCanMutateTask(ctx.role, actor.actorId, task, await loadAssigneeIds(ctx, id));
+      const { data, error } = await supabaseAdmin.from("task_items").update({
+        archived_at: archived ? (/* @__PURE__ */ new Date()).toISOString() : null,
+        updated_by: actor.actorId,
+        version: version + 1
+      }).eq("workspace_id", ctx.workspaceId).eq("id", id).eq("version", version).select(TASK_COLUMNS);
+      if (error) throw mapDbError(error, "archive task");
+      if (!data || data.length === 0) throw versionConflict();
+      await recordActivity(ctx, "task", id, archived ? "TASK_ARCHIVED" : "TASK_RESTORED");
+      ok(res, data[0]);
+    }));
+  }
+  router.put("/:id/assignees", guard("mutate", async (req, res, ctx) => {
+    const actor = requireResolvedActor(ctx.actor);
+    const id = requireUuid(req.params.id, "id");
+    const raw = req.body?.actorIds;
+    if (!Array.isArray(raw)) throw invalid("actorIds must be an array.");
+    if (raw.length > 50) throw invalid("A task may have at most 50 assignees.");
+    const next = [...new Set(raw.map((x) => requireUuid(x, "actorIds[]")))];
+    const task = await loadTask(ctx, id);
+    const current = await loadAssigneeIds(ctx, id);
+    assertCanMutateTask(ctx.role, actor.actorId, task, current);
+    assertCanApplyAssignments(ctx.role, actor.actorId, current, next);
+    const toAdd = next.filter((a) => !current.includes(a));
+    const toRemove = current.filter((a) => !next.includes(a));
+    if (toRemove.length) {
+      const { error } = await supabaseAdmin.from("task_assignments").delete().eq("workspace_id", ctx.workspaceId).eq("task_id", id).in("actor_id", toRemove);
+      if (error) throw mapDbError(error, "remove assignees");
+    }
+    if (toAdd.length) {
+      const { error } = await supabaseAdmin.from("task_assignments").insert(
+        toAdd.map((a) => ({
+          workspace_id: ctx.workspaceId,
+          task_id: id,
+          actor_id: a,
+          assigned_by: actor.actorId
+        }))
+      );
+      if (error) throw mapDbError(error, "add assignees");
+    }
+    await recordActivity(
+      ctx,
+      "assignment",
+      id,
+      "ASSIGNEES_REPLACED",
+      { added: toAdd.length, removed: toRemove.length }
+    );
+    ok(res, { taskId: id, assigneeActorIds: next });
+  }));
+  return router;
 }
 
 // _api_src/index.ts
@@ -3258,7 +4114,8 @@ function getMockGA4Report() {
     warnings: ["Google Analytics is not connected. Showing sample data."]
   };
 }
-var requireAuth = (allowedRoles) => {
+var requireAuth = (allowedRoles, options = {}) => {
+  const entitlementMode = options.entitlementMode ?? "enforce";
   return async (req, res, next) => {
     const authHeader = req.headers["x-auth-token"] || req.headers["authorization"];
     if (!authHeader) {
@@ -3276,7 +4133,7 @@ var requireAuth = (allowedRoles) => {
         return res.status(403).json({ status: "error", error: `Access Denied: insufficient role.` });
       }
       const ssoEntitlement = workspaceEntitlement(workspace2);
-      if (!ssoEntitlement.hasAccess) {
+      if (entitlementMode === "enforce" && !ssoEntitlement.hasAccess) {
         return res.status(403).json({
           status: "error",
           error: ssoEntitlement.denialReason,
@@ -3292,6 +4149,8 @@ var requireAuth = (allowedRoles) => {
       req.role = role2;
       req.token = token;
       req.supabaseUserId = ssoPayload.userId || "ghl_sso";
+      req.authSource = "ghl_sso";
+      req.ssoUserId = ssoPayload.userId || "";
       return next();
     }
     const { data: { user: authUser }, error: authError } = await supabaseAdmin.auth.getUser(token);
@@ -3334,7 +4193,7 @@ var requireAuth = (allowedRoles) => {
     }
     const entitlement = workspaceEntitlement(workspace);
     req.entitlement = entitlement;
-    if (!entitlement.hasAccess && !isSuperAdmin) {
+    if (entitlementMode === "enforce" && !entitlement.hasAccess && !isSuperAdmin) {
       return res.status(403).json({
         status: "error",
         error: entitlement.denialReason,
@@ -3351,11 +4210,12 @@ var requireAuth = (allowedRoles) => {
     req.role = role;
     req.token = token;
     req.supabaseUserId = authUser.id;
+    req.authSource = "supabase";
     next();
   };
 };
-var app = (0, import_express.default)();
-app.use(import_express.default.json());
+var app = (0, import_express2.default)();
+app.use(import_express2.default.json());
 app.get("/api/health/auth", async (_req, res) => {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   const result = await checkAuthReachability();
@@ -3375,6 +4235,7 @@ app.get("/api/health/auth", async (_req, res) => {
   }
   return res.status(200).json({ status: "ok" });
 });
+app.use("/api/tasks", requireAuth(void 0, { entitlementMode: "defer" }), createTaskRouter());
 app.post("/api/auth/login", async (req, res) => {
   const { email, password, impersonateToken } = req.body;
   let loginEmail;
@@ -3710,6 +4571,7 @@ app.post("/api/admin/suspend", requireAuth(["SUPER_ADMIN" /* SUPER_ADMIN */]), a
     suspended_at: on ? (/* @__PURE__ */ new Date()).toISOString() : null,
     suspension_reason: on ? reason || null : null
   }).eq("id", workspaceId);
+  if (on) await closeActiveTimersForWorkspace(workspaceId, "workspace_suspended");
   await logAction(
     workspaceId,
     req.user.id,
@@ -3810,6 +4672,7 @@ app.post("/api/admin/entitlement/revoke-license", requireAuth(["SUPER_ADMIN" /* 
     license_status: "REVOKED"
   }).eq("id", workspaceId);
   if (error) return res.status(500).json({ status: "error", error: `Database error: ${error.message}` });
+  await closeActiveTimersForWorkspace(workspaceId, "license_revoked");
   await logAction(
     workspaceId,
     req.user.id,

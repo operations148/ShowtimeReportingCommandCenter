@@ -1,27 +1,33 @@
-// DashPro Service Worker v4
+// DashPro Service Worker v5
 //
 // RULES:
-//  - Auth + SSO endpoints (/api/auth/*, /api/ghl/sso) → NEVER intercepted.
-//    They must always reach the network. Returning a synthetic error here
-//    causes verifySession to call logout() and bounce the user to login.
-//  - Non-auth API GET requests → network-first, cached for offline fallback.
+//  - NEVER_CACHED_API_PATHS → never intercepted, never stored, never served from cache.
+//    They must always reach the network.
+//  - Other API GET requests → network-first, cached for offline fallback.
 //  - Non-GET API requests (POST/PUT/DELETE) → network-only, never cached.
 //  - Static assets (JS/CSS/images) → cache-first, populated on first hit.
 //  - Navigation → SPA fallback to cached index.html when offline.
 
-const SHELL_CACHE = 'dashpro-shell-v4';
-const DATA_CACHE  = 'dashpro-data-v4';
+const SHELL_CACHE = 'dashpro-shell-v5';
+const DATA_CACHE  = 'dashpro-data-v5';
 const OLD_CACHES  = [
   'dashpro-v1', 'dashpro-v2',
   'dashpro-shell-v2', 'dashpro-data-v2',
-  'dashpro-shell-v3', 'dashpro-data-v3'
+  'dashpro-shell-v3', 'dashpro-data-v3',
+  // v4 data cache is retired so any /api/tasks responses that a previous worker may have
+  // stored are dropped rather than lingering as stale task data.
+  'dashpro-shell-v4', 'dashpro-data-v4'
 ];
 
-// Auth-related paths that must NEVER be served from cache.
-// /api/health/ is included deliberately: it is a GET under /api/, so without this it would
-// fall into the network-first data cache below and could serve a stale {"status":"ok"}
-// during a live outage — the one thing a health probe must never do.
-const AUTH_PATHS = ['/api/auth/', '/api/ghl/sso', '/api/health/'];
+// API paths that must NEVER be served from Cache Storage. Renamed from AUTH_PATHS because
+// the list is no longer auth-specific — it is now "responses where a stale answer is worse
+// than no answer at all":
+//   /api/auth/, /api/ghl/sso  a synthetic/cached error makes verifySession log the user out.
+//   /api/health/              a cached {"status":"ok"} would hide a live outage.
+//   /api/tasks/               task state is mutable and collaborative; a stale board, or a
+//                             stale ACTIVE TIMER showing a timer that was already stopped,
+//                             is actively misleading. Time data must never come from cache.
+const NEVER_CACHED_API_PATHS = ['/api/auth/', '/api/ghl/sso', '/api/health/', '/api/tasks/'];
 
 self.addEventListener('install', e => {
   e.waitUntil(
@@ -77,9 +83,11 @@ self.addEventListener('fetch', e => {
   // Only handle same-origin requests
   if (url.origin !== self.location.origin) return;
 
-  // ── AUTH + SSO: pass through entirely — never intercept ────────────────
-  // Intercepting these causes logout() to fire on any network hiccup.
-  if (AUTH_PATHS.some(p => url.pathname.startsWith(p))) {
+  // ── Never-cached APIs: pass through entirely — never intercept ─────────
+  // Auth/SSO: intercepting causes logout() to fire on any network hiccup.
+  // Health: a cached "ok" would mask a live outage.
+  // Tasks: stale board state or a stale active timer is worse than an error.
+  if (NEVER_CACHED_API_PATHS.some(p => url.pathname.startsWith(p))) {
     return; // browser handles it directly, no SW involvement
   }
 
