@@ -14,3 +14,10 @@ coverage/
 e2e/.artifacts/
 playwright-report/
 test-results/
+
+# Local agent/tooling config and one-off operational scripts. These are deliberately NOT
+# part of the repository. .claude/settings.json in particular has held live credentials
+# inlined in its allowed-command list, so an accidental `git add -A` must not be able to
+# publish it. Ignoring them enforces that mechanically rather than by remembering.
+.claude/
+scripts/add-showtime-members.mjs

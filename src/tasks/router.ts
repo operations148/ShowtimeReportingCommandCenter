@@ -18,6 +18,7 @@ import {
   ok, fail, handler, TaskError, notFound, invalid, versionConflict, mapDbError, applyNoStore
 } from './http.js';
 import { isTaskManagementEnabled, isTaskTimeTrackingEnabled } from './config.js';
+import { assertWorkspaceInRollout, RolloutExemptOperation } from './rollout.js';
 import { resolveActor, requireResolvedActor, ResolvedActor } from './actors.js';
 import {
   assertTaskEntitlement, closeActiveTimersForWorkspace, TaskOperation
@@ -43,7 +44,15 @@ const TASK_COLUMNS =
 function guard(
   operation: TaskOperation,
   fn: (req: any, res: any, ctx: Ctx) => Promise<void>,
-  opts: { requiresTimeTracking?: boolean } = {}
+  opts: {
+    requiresTimeTracking?: boolean;
+    /**
+     * Marks a route that must keep working while a workspace is being taken OUT of the
+     * rollout, so an already-running timer can still be seen and stopped. Only ever set on
+     * the two timer-recovery routes; neither can create data.
+     */
+    rolloutExempt?: RolloutExemptOperation;
+  } = {}
 ) {
   return handler(async (req: any, res: any) => {
     if (!isTaskManagementEnabled()) {
@@ -53,6 +62,11 @@ function guard(
       throw new TaskError(403, 'TASK_TIME_TRACKING_DISABLED', 'Time tracking is not enabled.');
     }
     v.rejectClientWorkspaceId(req.body, req.query);
+
+    // Staged rollout. Checked before entitlement and RBAC so a workspace outside the rollout
+    // is refused without the module doing any tenant work on its behalf. The id comes from
+    // the session via requireAuth — never from the request body or query.
+    assertWorkspaceInRollout(req.workspace?.id, { exemptOperation: opts.rolloutExempt });
 
     assertTaskEntitlement(req.entitlement, req.role, operation);
 
@@ -345,7 +359,7 @@ export function createTaskRouter(): express.Router {
       .eq('principal_id', ctx.actor.principalId).is('ended_at', null).maybeSingle();
     if (error) throw mapDbError(error, 'active timer');
     ok(res, { activeTimer: data ?? null, serverTime: new Date().toISOString() });
-  }));
+  }, { rolloutExempt: 'timer.active' }));
 
   router.post('/timer/start', guard('mutate', async (req, res, ctx) => {
     perm.assertCanTrackTime(ctx.role);
@@ -404,7 +418,7 @@ export function createTaskRouter(): express.Router {
       endedAt: row.ended_at, durationSeconds: Number(row.duration_seconds ?? 0),
       outcome: row.outcome
     });
-  }, { requiresTimeTracking: true }));
+  }, { requiresTimeTracking: true, rolloutExempt: 'timer.stop' }));
 
   // ── Manual time entries ─────────────────────────────────────────────────────────────
   router.post('/time-entries', guard('mutate', async (req, res, ctx) => {

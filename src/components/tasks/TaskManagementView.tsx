@@ -230,7 +230,9 @@ export default function TaskManagementView({ token, role }: Props) {
   }
 
   if (bootError) {
-    const terminal = ['TASK_MODULE_DISABLED', 'TASK_WORKSPACE_SUSPENDED'].includes(bootError.code ?? '');
+    // Retrying cannot fix any of these — they need an operator, not another request.
+    const terminal = ['TASK_MODULE_DISABLED', 'TASK_ROLLOUT_EXCLUDED', 'TASK_WORKSPACE_SUSPENDED']
+      .includes(bootError.code ?? '');
     return (
       <div role="alert" className="bg-white border border-slate-200 rounded-2xl p-12 text-center max-w-lg mx-auto space-y-3">
         <ShieldOff className="w-10 h-10 text-slate-500 mx-auto" aria-hidden="true" />

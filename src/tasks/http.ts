@@ -10,6 +10,8 @@
 /** Machine-readable error codes. Clients branch on these, never on message text. */
 export type TaskErrorCode =
   | 'TASK_MODULE_DISABLED'
+  /** The deployment runs the module, but this workspace is not in the current rollout. */
+  | 'TASK_ROLLOUT_EXCLUDED'
   | 'TASK_TIME_TRACKING_DISABLED'
   | 'TASK_ACTOR_UNRESOLVED'
   | 'TASK_ENTITLEMENT_EXPIRED'

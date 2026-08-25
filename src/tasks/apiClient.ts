@@ -16,7 +16,8 @@
 // ── Wire types (mirror the server payloads exactly; no invented fields) ────────────────
 
 export type TaskErrorCode =
-  | 'TASK_MODULE_DISABLED' | 'TASK_TIME_TRACKING_DISABLED' | 'TASK_ACTOR_UNRESOLVED'
+  | 'TASK_MODULE_DISABLED' | 'TASK_ROLLOUT_EXCLUDED'
+  | 'TASK_TIME_TRACKING_DISABLED' | 'TASK_ACTOR_UNRESOLVED'
   | 'TASK_ENTITLEMENT_EXPIRED' | 'TASK_WORKSPACE_SUSPENDED' | 'TASK_FORBIDDEN'
   | 'TASK_NOT_FOUND' | 'TASK_VALIDATION_FAILED' | 'TASK_VERSION_CONFLICT'
   | 'TASK_TIMER_CONFLICT' | 'TASK_NO_ACTIVE_TIMER' | 'TASK_INTERNAL_ERROR'
@@ -88,7 +89,8 @@ export class TaskApiError extends Error {
   }
   /** True when retrying verbatim cannot succeed and the user must change something. */
   get isTerminal(): boolean {
-    return ['TASK_MODULE_DISABLED', 'TASK_WORKSPACE_SUSPENDED', 'TASK_ACTOR_UNRESOLVED',
+    return ['TASK_MODULE_DISABLED', 'TASK_ROLLOUT_EXCLUDED',
+            'TASK_WORKSPACE_SUSPENDED', 'TASK_ACTOR_UNRESOLVED',
             'TASK_FORBIDDEN', 'TASK_NOT_FOUND'].includes(this.code);
   }
 }

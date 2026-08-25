@@ -2874,6 +2874,34 @@ function ghlIssuer() {
 var DEFAULT_PAGE_SIZE = 50;
 var MAX_PAGE_SIZE = 200;
 
+// src/tasks/rollout.ts
+var VALID_MODES = ["off", "canary", "all"];
+function rolloutMode() {
+  const raw = (process.env.TASK_MANAGEMENT_ROLLOUT_MODE ?? "").trim().toLowerCase();
+  return VALID_MODES.includes(raw) ? raw : "off";
+}
+function canaryWorkspaceIds() {
+  const raw = process.env.TASK_MANAGEMENT_CANARY_WORKSPACE_IDS;
+  if (typeof raw !== "string") return [];
+  return raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+}
+function isWorkspaceInRollout(workspaceId) {
+  const mode = rolloutMode();
+  if (mode === "off") return false;
+  if (mode === "all") return true;
+  if (typeof workspaceId !== "string" || workspaceId.trim() === "") return false;
+  return canaryWorkspaceIds().includes(workspaceId);
+}
+function assertWorkspaceInRollout(workspaceId, opts = {}) {
+  if (isWorkspaceInRollout(workspaceId)) return;
+  if (opts.exemptOperation) return;
+  throw new TaskError(
+    403,
+    "TASK_ROLLOUT_EXCLUDED",
+    "Task Management is not available for this workspace yet."
+  );
+}
+
 // src/tasks/actors.ts
 function identityFromRequest(req) {
   if (req.authSource === "ghl_sso") {
@@ -3139,6 +3167,7 @@ function guard(operation, fn, opts = {}) {
       throw new TaskError(403, "TASK_TIME_TRACKING_DISABLED", "Time tracking is not enabled.");
     }
     rejectClientWorkspaceId(req.body, req.query);
+    assertWorkspaceInRollout(req.workspace?.id, { exemptOperation: opts.rolloutExempt });
     assertTaskEntitlement(req.entitlement, req.role, operation);
     if (req.entitlement && !req.entitlement.hasAccess && req.entitlement.accessStatus !== "SUSPENDED") {
       await closeActiveTimersForWorkspace(req.workspace.id, "entitlement_expired");
@@ -3345,7 +3374,7 @@ function createTaskRouter() {
     const { data, error } = await supabaseAdmin.from("task_time_entries").select("id, task_id, workspace_id, started_at").eq("principal_id", ctx.actor.principalId).is("ended_at", null).maybeSingle();
     if (error) throw mapDbError(error, "active timer");
     ok(res, { activeTimer: data ?? null, serverTime: (/* @__PURE__ */ new Date()).toISOString() });
-  }));
+  }, { rolloutExempt: "timer.active" }));
   router.post("/timer/start", guard("mutate", async (req, res, ctx) => {
     assertCanTrackTime(ctx.role);
     const actor = requireResolvedActor(ctx.actor);
@@ -3413,7 +3442,7 @@ function createTaskRouter() {
       durationSeconds: Number(row.duration_seconds ?? 0),
       outcome: row.outcome
     });
-  }, { requiresTimeTracking: true }));
+  }, { requiresTimeTracking: true, rolloutExempt: "timer.stop" }));
   router.post("/time-entries", guard("mutate", async (req, res, ctx) => {
     assertCanTrackTime(ctx.role);
     const actor = requireResolvedActor(ctx.actor);

@@ -75,6 +75,15 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
   const [activeTab, setActiveTab] = useState<'dashboard' | 'opportunity-dashboard' | 'sales-dashboard' | 'appointment-dashboard' | 'marketing-dashboard' | 'estimates-dashboard' | 'ghl-settings' | 'integrations' | 'settings' | 'admin' | 'client-trials' | 'task-management' | 'billing'>('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const navigate = (tab: typeof activeTab) => { setActiveTab(tab); setSidebarOpen(false); };
+
+  // Switching to a workspace outside the Task Management rollout must not strand the user on
+  // a view whose every request would be refused. Fall back to the dashboard instead of
+  // rendering an empty pane. The server gate is unaffected either way.
+  useEffect(() => {
+    if (activeTab === 'task-management' && !isTaskManagementUiEnabled(activeWorkspace?.id)) {
+      setActiveTab('dashboard');
+    }
+  }, [activeTab, activeWorkspace?.id]);
   
   // Dashboard states
   const [metrics, setMetrics] = useState<DashboardMetrics>(initialMetrics);
@@ -493,7 +502,7 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
 
             {/* Task Management — hidden unless the client flag is explicitly enabled.
                 The API is protected separately by the server-side flag. */}
-            {isTaskManagementUiEnabled() && (
+            {isTaskManagementUiEnabled(activeWorkspace?.id) && (
               <button
                 onClick={() => navigate('task-management')}
                 id="nav-btn-task-management"
@@ -764,7 +773,7 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
                 />
               )}
 
-              {activeTab === 'task-management' && isTaskManagementUiEnabled() && (
+              {activeTab === 'task-management' && isTaskManagementUiEnabled(activeWorkspace?.id) && (
                 <TaskManagementView token={token} role={role} />
               )}
 

@@ -85,6 +85,12 @@ Below is the exhaustive matrix of available variables. Always keep server-only k
 | **`SUPABASE_URL`** | Core Engine | **Yes** | Yes | *None* | Base URL of the Supabase project backing authentication and all tenant data. Must be paired with a `SUPABASE_SERVICE_ROLE_KEY` from the **same** project. Set in both Production and Preview scopes if Preview logins are needed. |
 | **`SUPABASE_SERVICE_ROLE_KEY`** | Core Engine | **Yes** | Yes | *None* | Service-role key for the same Supabase project. Bypasses Row Level Security — never expose to the client, never prefix with `VITE_`. |
 | **`DATABASE_URL`** | Tooling | No | Yes | *None* | Direct Postgres connection string (Session Pooler, IPv4) used only by `scripts/migrate.mjs` for schema migrations. Not read by the deployed API. |
+| **`TASK_MANAGEMENT_ENABLED`** | Task Management | No | Yes | `false` | Master server switch. When false every `/api/tasks/*` route refuses with `403 TASK_MODULE_DISABLED` before any authorization or data access. |
+| **`TASK_TIME_TRACKING_ENABLED`** | Task Management | No | Yes | `false` | Time engine sub-switch. Implies nothing unless the master switch is on. |
+| **`TASK_MANAGEMENT_ROLLOUT_MODE`** | Task Management | No | Yes | `off` | Staged rollout gate: `off` \| `canary` \| `all`. **Fails closed** — any absent, blank or unrecognised value resolves to `off`. `all` is reserved for the approved production release. |
+| **`TASK_MANAGEMENT_CANARY_WORKSPACE_IDS`** | Task Management | No | Yes | *Empty* | Comma-separated workspace ids admitted while the mode is `canary`. Exact, case-sensitive matching. An empty or unparseable list admits nobody. |
+| **`VITE_TASK_MANAGEMENT_ENABLED`** | Task Management | No | Yes | `false` | Client-side nav visibility only — **not** a security boundary. Inlined at build time and readable in the shipped bundle. |
+| **`VITE_TASK_MANAGEMENT_CANARY_WORKSPACE_IDS`** | Task Management | No | Yes | *Empty* | Client mirror of the canary allowlist, so the tab is not shown to a tenant whose API calls would be refused. Workspace ids are not secrets. |
 | **`GHL_AUTH_MODE`** | Integrations | Yes | Yes | `private_token` | `private_token` for single-workspace custom integrations, `oauth` for SaaS marketplace setups. |
 | **`GHL_PRIVATE_INTEGRATION_TOKEN`** | Integrations | Conditionally | Yes | *None* | Key obtained from GoHighLevel Settings > Company/Location > API Keys. |
 | **`GHL_LOCATION_ID`** | Integrations | Conditionally | Yes | *None* | Focus Location identifier to bind the initial custom integration. |
