@@ -8,3 +8,9 @@ coverage/
 !.env.example
 
 .vercel
+
+# Browser QA artifacts (screenshots, traces, failure contexts). Generated on every run and
+# never part of the app; the specs and fixtures under e2e/ are tracked, this output is not.
+e2e/.artifacts/
+playwright-report/
+test-results/

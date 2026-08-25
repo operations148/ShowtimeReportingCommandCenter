@@ -1,0 +1,267 @@
+/**
+ * Typed browser client for /api/tasks.
+ *
+ * Contract notes that matter:
+ *   * Success is always { status:'success', data, ...extra }; failure is always
+ *     { status:'error', code, error, ...extra }. Callers branch on `code`, never on message
+ *     text, because messages are user-facing prose and may change.
+ *   * The workspace is NEVER sent. The server derives it from the session and rejects any
+ *     client-supplied workspace_id with 422 — so sending one is a bug, not a convenience.
+ *   * Every request is `cache: 'no-store'`. The service worker also refuses to cache
+ *     /api/tasks/, so a stale board or a stale active timer can never be served.
+ *   * The backend remains authoritative for auth, isolation, entitlement, RBAC and timer
+ *     concurrency. Anything this module reports about permissions is a usability hint.
+ */
+
+// ── Wire types (mirror the server payloads exactly; no invented fields) ────────────────
+
+export type TaskErrorCode =
+  | 'TASK_MODULE_DISABLED' | 'TASK_TIME_TRACKING_DISABLED' | 'TASK_ACTOR_UNRESOLVED'
+  | 'TASK_ENTITLEMENT_EXPIRED' | 'TASK_WORKSPACE_SUSPENDED' | 'TASK_FORBIDDEN'
+  | 'TASK_NOT_FOUND' | 'TASK_VALIDATION_FAILED' | 'TASK_VERSION_CONFLICT'
+  | 'TASK_TIMER_CONFLICT' | 'TASK_NO_ACTIVE_TIMER' | 'TASK_INTERNAL_ERROR'
+  | 'TASK_UNAUTHENTICATED' | 'TASK_NETWORK';
+
+export type Priority = 'urgent' | 'high' | 'normal' | 'low';
+export type StatusCategory = 'todo' | 'in_progress' | 'done';
+export type TimeVisibility = 'team' | 'own' | 'aggregate_only';
+
+export interface TaskSpace {
+  id: string; name: string; position: number; version: number; archived_at: string | null;
+}
+export interface TaskList {
+  id: string; space_id: string; name: string; position: number;
+  is_default: boolean; version: number; archived_at: string | null;
+}
+export interface TaskStatus {
+  id: string; space_id: string; name: string; category: StatusCategory;
+  color: string | null; position: number; is_default: boolean;
+  version: number; archived_at: string | null;
+}
+export interface TaskItem {
+  id: string; list_id: string; status_id: string; parent_task_id: string | null;
+  title: string; description: string | null; priority: Priority;
+  start_date: string | null; due_date: string | null;
+  time_estimate_seconds: number | null;
+  position: number; version: number; archived_at: string | null;
+  created_by: string | null; updated_by: string | null;
+  created_at: string; updated_at: string;
+  assigneeActorIds: string[];
+  subtaskCount?: number;
+  subtasks?: TaskItem[];
+}
+export interface WorkspaceActor {
+  actorId: string; displayName: string | null; email: string | null;
+  archived: boolean; isSelf: boolean;
+}
+export interface ActiveTimer { id: string; task_id: string; started_at: string; }
+export interface TimeEntry {
+  id: string; task_id: string; actor_id: string;
+  started_at: string; ended_at: string | null;
+  source: 'timer' | 'manual'; note: string | null; archived_at?: string | null;
+}
+export interface ActivityEvent {
+  id: string; actor_id: string | null; entity_type: string;
+  action: string; detail: Record<string, unknown>; created_at: string;
+}
+export interface Capabilities {
+  canManageHierarchy: boolean; canCreateTask: boolean; canAssignOthers: boolean;
+  timeVisibility: TimeVisibility; timeTrackingEnabled: boolean; actorResolved: boolean;
+}
+export interface Bootstrap {
+  spaces: TaskSpace[]; lists: TaskList[]; statuses: TaskStatus[];
+  activeTimer: ActiveTimer | null; capabilities: Capabilities;
+}
+export interface PageInfo { page: number; pageSize: number; total: number; }
+
+/** Normalised failure. Every rejection from this client is one of these. */
+export class TaskApiError extends Error {
+  constructor(
+    public status: number,
+    public code: TaskErrorCode,
+    message: string,
+    /** Extra payload the server attached, e.g. the running timer on a 409. */
+    public payload: Record<string, any> = {}
+  ) {
+    super(message);
+    this.name = 'TaskApiError';
+  }
+  /** True when retrying verbatim cannot succeed and the user must change something. */
+  get isTerminal(): boolean {
+    return ['TASK_MODULE_DISABLED', 'TASK_WORKSPACE_SUSPENDED', 'TASK_ACTOR_UNRESOLVED',
+            'TASK_FORBIDDEN', 'TASK_NOT_FOUND'].includes(this.code);
+  }
+}
+
+interface RequestOptions {
+  signal?: AbortSignal;
+  body?: unknown;
+  query?: Record<string, string | number | boolean | undefined | null>;
+}
+
+function buildQuery(query?: RequestOptions['query']): string {
+  if (!query) return '';
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(query)) {
+    if (v === undefined || v === null || v === '') continue;
+    p.set(k, String(v));
+  }
+  const s = p.toString();
+  return s ? `?${s}` : '';
+}
+
+export function createTaskApi(getToken: () => string) {
+  async function request<T>(
+    method: string, path: string, opts: RequestOptions = {}
+  ): Promise<{ data: T; page?: PageInfo; raw: any }> {
+    const headers: Record<string, string> = { 'x-auth-token': getToken() };
+    if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
+
+    let res: Response;
+    try {
+      res = await fetch(`/api/tasks${path}${buildQuery(opts.query)}`, {
+        method,
+        headers,
+        body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+        signal: opts.signal,
+        cache: 'no-store'
+      });
+    } catch (err: any) {
+      // Abort is a normal control-flow signal, not an error to surface.
+      if (err?.name === 'AbortError') throw err;
+      throw new TaskApiError(0, 'TASK_NETWORK',
+        'Could not reach the server. Check your connection and try again.');
+    }
+
+    const text = await res.text();
+    let json: any = null;
+    try { json = text ? JSON.parse(text) : null; } catch { /* non-JSON body */ }
+
+    if (!res.ok || json?.status === 'error') {
+      const code: TaskErrorCode =
+        json?.code ?? (res.status === 401 ? 'TASK_UNAUTHENTICATED' : 'TASK_INTERNAL_ERROR');
+      const message = json?.error ?? `Request failed (${res.status}).`;
+      const { status: _s, code: _c, error: _e, ...payload } = json ?? {};
+      throw new TaskApiError(res.status, code, message, payload);
+    }
+    return { data: json?.data as T, page: json?.page, raw: json };
+  }
+
+  return {
+    // Reads
+    bootstrap: (signal?: AbortSignal) =>
+      request<Bootstrap>('GET', '/bootstrap', { signal }).then(r => r.data),
+
+    actors: (signal?: AbortSignal) =>
+      request<WorkspaceActor[]>('GET', '/actors', { signal }).then(r => r.data),
+
+    statuses: (spaceId: string, signal?: AbortSignal) =>
+      request<TaskStatus[]>('GET', '/statuses', { query: { spaceId }, signal }).then(r => r.data),
+
+    listTasks: (query: Record<string, any>, signal?: AbortSignal) =>
+      request<TaskItem[]>('GET', '/', { query, signal })
+        .then(r => ({ tasks: r.data ?? [], page: r.page })),
+
+    getTask: (id: string, signal?: AbortSignal) =>
+      request<TaskItem>('GET', `/${id}`, { signal }).then(r => r.data),
+
+    activity: (id: string, signal?: AbortSignal) =>
+      request<ActivityEvent[]>('GET', `/${id}/activity`, { signal }).then(r => r.data),
+
+    taskTimeEntries: (id: string, signal?: AbortSignal) =>
+      request<{ entries: TimeEntry[]; visibility: TimeVisibility }>(
+        'GET', `/${id}/time-entries`, { signal }).then(r => r.data),
+
+    timeSummary: (query: Record<string, any> = {}, signal?: AbortSignal) =>
+      request<{ byTask: { taskId: string; trackedSeconds: number }[];
+                byMember: { actorId: string; trackedSeconds: number }[];
+                visibility: TimeVisibility }>('GET', '/time/summary', { query, signal })
+        .then(r => r.data),
+
+    // Hierarchy
+    createSpace: (name: string) =>
+      request<{ spaceId: string; defaultListId: string }>('POST', '/spaces', { body: { name } })
+        .then(r => r.data),
+    updateSpace: (id: string, body: Record<string, unknown>) =>
+      request<TaskSpace>('PATCH', `/spaces/${id}`, { body }).then(r => r.data),
+
+    createList: (body: { spaceId: string; name: string; position?: number }) =>
+      request<TaskList>('POST', '/lists', { body }).then(r => r.data),
+    updateList: (id: string, body: Record<string, unknown>) =>
+      request<TaskList>('PATCH', `/lists/${id}`, { body }).then(r => r.data),
+
+    createStatus: (body: { spaceId: string; name: string; category: StatusCategory; color?: string }) =>
+      request<TaskStatus>('POST', '/statuses', { body }).then(r => r.data),
+    updateStatus: (id: string, body: Record<string, unknown>) =>
+      request<TaskStatus>('PATCH', `/statuses/${id}`, { body }).then(r => r.data),
+
+    // Tasks
+    createTask: (body: Record<string, unknown>) =>
+      request<TaskItem>('POST', '/', { body }).then(r => r.data),
+    updateTask: (id: string, body: Record<string, unknown>) =>
+      request<TaskItem>('PATCH', `/${id}`, { body }).then(r => r.data),
+    archiveTask: (id: string, version: number) =>
+      request<TaskItem>('POST', `/${id}/archive`, { body: { version } }).then(r => r.data),
+    restoreTask: (id: string, version: number) =>
+      request<TaskItem>('POST', `/${id}/restore`, { body: { version } }).then(r => r.data),
+    setAssignees: (id: string, actorIds: string[]) =>
+      request<{ taskId: string; assigneeActorIds: string[] }>(
+        'PUT', `/${id}/assignees`, { body: { actorIds } }).then(r => r.data),
+
+    // Time
+    activeTimer: (signal?: AbortSignal) =>
+      request<{ activeTimer: ActiveTimer | null; serverTime?: string }>(
+        'GET', '/timer/active', { signal }).then(r => r.data),
+
+    /**
+     * Starts a timer. `clientToken` MUST be stable across retries of the same user intent —
+     * the server dedupes on it, so a retried request returns the original entry instead of
+     * creating a second one.
+     */
+    startTimer: (taskId: string, clientToken: string) =>
+      request<{ entryId: string; taskId: string; startedAt: string;
+                outcome: string; serverTime: string }>(
+        'POST', '/timer/start', { body: { taskId, clientToken } }).then(r => r.data),
+
+    stopTimer: (entryId?: string) =>
+      request<{ entryId: string; taskId: string; startedAt: string; endedAt: string;
+                durationSeconds: number; outcome: string }>(
+        'POST', '/timer/stop', { body: entryId ? { entryId } : {} }).then(r => r.data),
+
+    addManualEntry: (body: { taskId: string; startedAt: string; endedAt: string; note?: string }) =>
+      request<TimeEntry>('POST', '/time-entries', { body }).then(r => r.data),
+    updateTimeEntry: (id: string, body: Record<string, unknown>) =>
+      request<TimeEntry>('PATCH', `/time-entries/${id}`, { body }).then(r => r.data)
+  };
+}
+
+export type TaskApi = ReturnType<typeof createTaskApi>;
+
+/** RFC4122 v4 token for timer idempotency. Uses crypto when available. */
+export function newClientToken(): string {
+  const c: any = globalThis.crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  const b = new Uint8Array(16);
+  (c?.getRandomValues ? c.getRandomValues(b) : b.forEach((_, i) => (b[i] = Math.floor(Math.random() * 256))));
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
+}
+
+/** Formats seconds as H:MM:SS for timer displays. */
+export function formatDuration(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+}
+
+/** Compact "2h 15m" style for summaries. */
+export function formatTracked(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  if (s < 60) return `${s}s`;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h ? `${h}h ${m}m` : `${m}m`;
+}

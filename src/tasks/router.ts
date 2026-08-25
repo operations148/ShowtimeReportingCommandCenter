@@ -157,6 +157,30 @@ export function createTaskRouter(): express.Router {
     });
   }));
 
+  // ── Workspace actors (assignee directory) ───────────────────────────────────────────
+  // The task payloads carry assigneeActorIds only; without this the UI cannot render a
+  // name for an assignee or offer a picker. Returns UI snapshots for THIS workspace only —
+  // never a principal id, external id, or any cross-tenant record.
+  //
+  // Visible to every role that can view the module: an assignee is task metadata, not
+  // time data. D7's restriction on "employee-level identities" governs TIME entries, which
+  // are filtered separately below.
+  router.get('/actors', guard('read', async (_req, res, ctx) => {
+    const { data, error } = await supabaseAdmin
+      .from('task_workspace_actors')
+      .select('id, display_name, email, archived_at')
+      .eq('workspace_id', ctx.workspaceId)
+      .order('display_name', { nullsFirst: false });
+    if (error) throw mapDbError(error, 'list actors');
+    ok(res, (data ?? []).map((a: any) => ({
+      actorId: a.id,
+      displayName: a.display_name,
+      email: a.email,
+      archived: a.archived_at !== null,
+      isSelf: ctx.actor?.actorId === a.id
+    })));
+  }));
+
   // ── Spaces ──────────────────────────────────────────────────────────────────────────
   router.post('/spaces', guard('mutate', async (req, res, ctx) => {
     perm.assertCanManageHierarchy(ctx.role);
@@ -282,6 +306,16 @@ export function createTaskRouter(): express.Router {
     if (req.body?.name !== undefined) patch.name = v.requireString(req.body.name, 'name', 1, 60);
     if (req.body?.category !== undefined) {
       patch.category = v.requireEnum(req.body.category, 'category', v.STATUS_CATEGORIES);
+    }
+    // Colour was settable on create but not on update, so an existing status could never be
+    // recoloured. Validated here against the same 6-digit hex shape the CHECK constraint
+    // enforces, so a bad value fails as a clean 422 rather than a database violation.
+    if (req.body?.color !== undefined) {
+      const color = v.optionalString(req.body.color, 'color', 7);
+      if (color !== null && !/^#[0-9A-Fa-f]{6}$/.test(color)) {
+        throw invalid('color must be a 6-digit hex value such as #2563EB.');
+      }
+      patch.color = color;
     }
     if (req.body?.position !== undefined) patch.position = Number(req.body.position);
     if (req.body?.archived === true) patch.archived_at = new Date().toISOString();
@@ -511,8 +545,28 @@ export function createTaskRouter(): express.Router {
       byTask.set(a.task_id, [...(byTask.get(a.task_id) ?? []), a.actor_id]);
     }
 
+    // Subtask counts for the whole page in ONE query (never one per row). Only root tasks
+    // can have children, so this is skipped entirely when the page has none.
+    const subtaskCounts = new Map<string, number>();
+    const rootIds = (data ?? []).filter((t: any) => t.parent_task_id === null).map((t: any) => t.id);
+    if (rootIds.length) {
+      const { data: subs, error: sErr } = await supabaseAdmin.from('task_items')
+        .select('parent_task_id')
+        .eq('workspace_id', ctx.workspaceId)
+        .in('parent_task_id', rootIds)
+        .is('archived_at', null);
+      if (sErr) throw mapDbError(sErr, 'subtask counts');
+      for (const s of subs ?? []) {
+        subtaskCounts.set(s.parent_task_id, (subtaskCounts.get(s.parent_task_id) ?? 0) + 1);
+      }
+    }
+
     ok(res,
-      (data ?? []).map((t: any) => ({ ...t, assigneeActorIds: byTask.get(t.id) ?? [] })),
+      (data ?? []).map((t: any) => ({
+        ...t,
+        assigneeActorIds: byTask.get(t.id) ?? [],
+        subtaskCount: subtaskCounts.get(t.id) ?? 0
+      })),
       { page: { page, pageSize, total: count ?? 0 } }
     );
   }));
@@ -559,6 +613,48 @@ export function createTaskRouter(): express.Router {
         .eq('workspace_id', ctx.workspaceId).eq('parent_task_id', id).order('position')
     ]);
     ok(res, { ...task, assigneeActorIds: assignees, subtasks: subtasks.data ?? [] });
+  }));
+
+  // Activity history for one task. Read-scoped to the workspace; `detail` is a curated
+  // summary written by recordActivity and never contains tokens or other tenants' ids.
+  router.get('/:id/activity', guard('read', async (req, res, ctx) => {
+    const id = v.requireUuid(req.params.id, 'id');
+    await loadTask(ctx, id); // 404s if the task is not in this workspace
+    const { pageSize, offset } = v.parsePagination(req.query);
+    const { data, error } = await supabaseAdmin
+      .from('task_activity_events')
+      .select('id, actor_id, entity_type, action, detail, created_at')
+      .eq('workspace_id', ctx.workspaceId)
+      .eq('entity_id', id)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + pageSize - 1);
+    if (error) throw mapDbError(error, 'task activity');
+    ok(res, data ?? []);
+  }));
+
+  // Time entries for one task, filtered by D7 visibility:
+  //   manager     -> every entry
+  //   contributor -> only their own
+  //   read_only   -> none; they get the aggregate from /time/summary instead, and must not
+  //                  see employee-level entries, identities or notes.
+  router.get('/:id/time-entries', guard('read', async (req, res, ctx) => {
+    const id = v.requireUuid(req.params.id, 'id');
+    await loadTask(ctx, id);
+    const visibility = perm.timeVisibilityFor(ctx.role);
+    if (visibility === 'aggregate_only') {
+      return ok(res, { entries: [], visibility });
+    }
+    let q = supabaseAdmin.from('task_time_entries')
+      .select('id, task_id, actor_id, started_at, ended_at, source, note, archived_at')
+      .eq('workspace_id', ctx.workspaceId).eq('task_id', id).is('archived_at', null);
+    // Filtered in the QUERY, not by trimming a wider result set afterwards.
+    if (visibility === 'own') {
+      if (!ctx.actor) return ok(res, { entries: [], visibility });
+      q = q.eq('actor_id', ctx.actor.actorId);
+    }
+    const { data, error } = await q.order('started_at', { ascending: false }).limit(200);
+    if (error) throw mapDbError(error, 'task time entries');
+    ok(res, { entries: data ?? [], visibility });
   }));
 
   router.patch('/:id', guard('mutate', async (req, res, ctx) => {

@@ -29,6 +29,7 @@ import {
   PowerOff,
   Menu,
   Plug,
+  CheckSquare,
   X
 } from 'lucide-react';
 
@@ -50,6 +51,8 @@ import SaaSAuthLayer from './components/SaaSAuthLayer';
 import TrialNoticeBanner from './components/TrialNoticeBanner';
 import IntegrationsCenterView from './components/IntegrationsCenterView';
 import ClientTrialsView from './components/ClientTrialsView';
+import TaskManagementView from './components/tasks/TaskManagementView';
+import { isTaskManagementUiEnabled } from './tasks/featureFlag';
 import { UserRole } from './types';
 
 // Fallbacks if server fails/loads
@@ -69,7 +72,7 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
   // Dismissal is per-session by design: it must reappear on the next visit as the deadline
   // nears. Persisting it would let a user permanently silence the last warning before lockout.
   const [trialNoticeDismissed, setTrialNoticeDismissed] = useState(false);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'opportunity-dashboard' | 'sales-dashboard' | 'appointment-dashboard' | 'marketing-dashboard' | 'estimates-dashboard' | 'ghl-settings' | 'integrations' | 'settings' | 'admin' | 'client-trials' | 'billing'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'opportunity-dashboard' | 'sales-dashboard' | 'appointment-dashboard' | 'marketing-dashboard' | 'estimates-dashboard' | 'ghl-settings' | 'integrations' | 'settings' | 'admin' | 'client-trials' | 'task-management' | 'billing'>('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const navigate = (tab: typeof activeTab) => { setActiveTab(tab); setSidebarOpen(false); };
   
@@ -488,6 +491,23 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
               Client Trials
             </button>
 
+            {/* Task Management — hidden unless the client flag is explicitly enabled.
+                The API is protected separately by the server-side flag. */}
+            {isTaskManagementUiEnabled() && (
+              <button
+                onClick={() => navigate('task-management')}
+                id="nav-btn-task-management"
+                className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition-all text-left cursor-pointer ${
+                  activeTab === 'task-management'
+                    ? 'bg-blue-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:bg-[#111c2e] hover:text-white'
+                }`}
+              >
+                <CheckSquare className="w-4 h-4 shrink-0 text-blue-500" />
+                Task Management
+              </button>
+            )}
+
             {/* Billing Link */}
             <button
               onClick={() => navigate('billing')}
@@ -742,6 +762,10 @@ function AppCockpit({ user, activeWorkspace, role, workspaces, token, logout, tr
                   activeRole={role}
                   sessionToken={token}
                 />
+              )}
+
+              {activeTab === 'task-management' && isTaskManagementUiEnabled() && (
+                <TaskManagementView token={token} role={role} />
               )}
 
               {activeTab === 'billing' && (

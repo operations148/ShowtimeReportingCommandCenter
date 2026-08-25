@@ -3208,6 +3208,17 @@ function createTaskRouter() {
       }
     });
   }));
+  router.get("/actors", guard("read", async (_req, res, ctx) => {
+    const { data, error } = await supabaseAdmin.from("task_workspace_actors").select("id, display_name, email, archived_at").eq("workspace_id", ctx.workspaceId).order("display_name", { nullsFirst: false });
+    if (error) throw mapDbError(error, "list actors");
+    ok(res, (data ?? []).map((a) => ({
+      actorId: a.id,
+      displayName: a.display_name,
+      email: a.email,
+      archived: a.archived_at !== null,
+      isSelf: ctx.actor?.actorId === a.id
+    })));
+  }));
   router.post("/spaces", guard("mutate", async (req, res, ctx) => {
     assertCanManageHierarchy(ctx.role);
     const name = requireString(req.body?.name, "name", 1, 120);
@@ -3309,6 +3320,13 @@ function createTaskRouter() {
     if (req.body?.name !== void 0) patch.name = requireString(req.body.name, "name", 1, 60);
     if (req.body?.category !== void 0) {
       patch.category = requireEnum(req.body.category, "category", STATUS_CATEGORIES);
+    }
+    if (req.body?.color !== void 0) {
+      const color = optionalString(req.body.color, "color", 7);
+      if (color !== null && !/^#[0-9A-Fa-f]{6}$/.test(color)) {
+        throw invalid("color must be a 6-digit hex value such as #2563EB.");
+      }
+      patch.color = color;
     }
     if (req.body?.position !== void 0) patch.position = Number(req.body.position);
     if (req.body?.archived === true) patch.archived_at = (/* @__PURE__ */ new Date()).toISOString();
@@ -3500,9 +3518,22 @@ function createTaskRouter() {
     for (const a of assignments) {
       byTask.set(a.task_id, [...byTask.get(a.task_id) ?? [], a.actor_id]);
     }
+    const subtaskCounts = /* @__PURE__ */ new Map();
+    const rootIds = (data ?? []).filter((t) => t.parent_task_id === null).map((t) => t.id);
+    if (rootIds.length) {
+      const { data: subs, error: sErr } = await supabaseAdmin.from("task_items").select("parent_task_id").eq("workspace_id", ctx.workspaceId).in("parent_task_id", rootIds).is("archived_at", null);
+      if (sErr) throw mapDbError(sErr, "subtask counts");
+      for (const s of subs ?? []) {
+        subtaskCounts.set(s.parent_task_id, (subtaskCounts.get(s.parent_task_id) ?? 0) + 1);
+      }
+    }
     ok(
       res,
-      (data ?? []).map((t) => ({ ...t, assigneeActorIds: byTask.get(t.id) ?? [] })),
+      (data ?? []).map((t) => ({
+        ...t,
+        assigneeActorIds: byTask.get(t.id) ?? [],
+        subtaskCount: subtaskCounts.get(t.id) ?? 0
+      })),
       { page: { page, pageSize, total: count ?? 0 } }
     );
   }));
@@ -3545,6 +3576,30 @@ function createTaskRouter() {
       supabaseAdmin.from("task_items").select(TASK_COLUMNS).eq("workspace_id", ctx.workspaceId).eq("parent_task_id", id).order("position")
     ]);
     ok(res, { ...task, assigneeActorIds: assignees, subtasks: subtasks.data ?? [] });
+  }));
+  router.get("/:id/activity", guard("read", async (req, res, ctx) => {
+    const id = requireUuid(req.params.id, "id");
+    await loadTask(ctx, id);
+    const { pageSize, offset } = parsePagination(req.query);
+    const { data, error } = await supabaseAdmin.from("task_activity_events").select("id, actor_id, entity_type, action, detail, created_at").eq("workspace_id", ctx.workspaceId).eq("entity_id", id).order("created_at", { ascending: false }).range(offset, offset + pageSize - 1);
+    if (error) throw mapDbError(error, "task activity");
+    ok(res, data ?? []);
+  }));
+  router.get("/:id/time-entries", guard("read", async (req, res, ctx) => {
+    const id = requireUuid(req.params.id, "id");
+    await loadTask(ctx, id);
+    const visibility = timeVisibilityFor(ctx.role);
+    if (visibility === "aggregate_only") {
+      return ok(res, { entries: [], visibility });
+    }
+    let q = supabaseAdmin.from("task_time_entries").select("id, task_id, actor_id, started_at, ended_at, source, note, archived_at").eq("workspace_id", ctx.workspaceId).eq("task_id", id).is("archived_at", null);
+    if (visibility === "own") {
+      if (!ctx.actor) return ok(res, { entries: [], visibility });
+      q = q.eq("actor_id", ctx.actor.actorId);
+    }
+    const { data, error } = await q.order("started_at", { ascending: false }).limit(200);
+    if (error) throw mapDbError(error, "task time entries");
+    ok(res, { entries: data ?? [], visibility });
   }));
   router.patch("/:id", guard("mutate", async (req, res, ctx) => {
     const actor = requireResolvedActor(ctx.actor);
