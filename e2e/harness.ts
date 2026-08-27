@@ -106,7 +106,7 @@ export async function installApi(
     const path = url.pathname;
     const key = `${req.method()} ${path}`;
     // Overrides match on method + path + query, so a test can single out the task LIST
-    // request (`GET /api/tasks/?`) without also catching `GET /api/tasks/bootstrap`.
+    // request (`GET /api/tasks?`) without also catching `GET /api/tasks/bootstrap`.
     const keyWithQuery = key + url.search;
     state.seen.push(keyWithQuery);
 

@@ -3403,7 +3403,7 @@ function createTaskRouter() {
       );
     }
     if (row.outcome === "started") {
-      await recordActivity(ctx, "time_entry", row.entry_id, "TIMER_STARTED", { taskId });
+      await recordActivity(ctx, "task", taskId, "TIMER_STARTED", { entryId: row.entry_id });
     }
     ok(res, {
       entryId: row.entry_id,
@@ -3428,10 +3428,10 @@ function createTaskRouter() {
     if (row.outcome === "stopped") {
       await recordActivity(
         ctx,
-        "time_entry",
-        row.entry_id,
+        "task",
+        row.task_id,
         "TIMER_STOPPED",
-        { taskId: row.task_id, durationSeconds: row.duration_seconds }
+        { entryId: row.entry_id, durationSeconds: row.duration_seconds }
       );
     }
     ok(res, {
@@ -3465,7 +3465,7 @@ function createTaskRouter() {
       note
     }).select("id, task_id, actor_id, started_at, ended_at, source, note").single();
     if (error) throw mapDbError(error, "create manual entry");
-    await recordActivity(ctx, "time_entry", data.id, "MANUAL_TIME_ADDED", { taskId });
+    await recordActivity(ctx, "task", taskId, "MANUAL_TIME_ADDED", { entryId: data.id });
     ok(res, data);
   }, { requiresTimeTracking: true }));
   router.patch("/time-entries/:id", guard("mutate", async (req, res, ctx) => {
@@ -3488,7 +3488,7 @@ function createTaskRouter() {
     if (Object.keys(patch).length === 0) throw invalid("No supported fields supplied.");
     const { data, error } = await supabaseAdmin.from("task_time_entries").update(patch).eq("workspace_id", ctx.workspaceId).eq("id", id).select("id, task_id, actor_id, started_at, ended_at, source, note, archived_at").single();
     if (error) throw mapDbError(error, "update time entry");
-    await recordActivity(ctx, "time_entry", id, "TIME_ENTRY_UPDATED");
+    await recordActivity(ctx, "task", data.task_id, "TIME_ENTRY_UPDATED", { entryId: id });
     ok(res, data);
   }, { requiresTimeTracking: true }));
   router.get("/time/summary", guard("read", async (req, res, ctx) => {

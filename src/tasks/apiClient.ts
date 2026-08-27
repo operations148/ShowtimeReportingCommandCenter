@@ -119,9 +119,18 @@ export function createTaskApi(getToken: () => string) {
     const headers: Record<string, string> = { 'x-auth-token': getToken() };
     if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
 
+    // The router is mounted at /api/tasks, so its root route is addressed as path '/'.
+    // Naively concatenating that yields '/api/tasks/', and Vercel's rewrite
+    // (/api/:path* -> /api/index) does NOT match a bare trailing slash: the request is
+    // answered with a platform-level 404 before it ever reaches Express. Verified against a
+    // live deployment — '/api/tasks/' 404s while '/api/tasks' returns 200 for the same query
+    // and token, and '/api/tasks/bootstrap/' 404s while '/api/tasks/bootstrap' succeeds.
+    // Collapsing the root path to '' keeps every call on a shape the rewrite matches.
+    const suffix = path === '/' ? '' : path;
+
     let res: Response;
     try {
-      res = await fetch(`/api/tasks${path}${buildQuery(opts.query)}`, {
+      res = await fetch(`/api/tasks${suffix}${buildQuery(opts.query)}`, {
         method,
         headers,
         body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,

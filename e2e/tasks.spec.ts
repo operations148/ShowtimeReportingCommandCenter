@@ -126,7 +126,7 @@ test.describe('Task list, filtering and sorting', () => {
 
   test('shows a retryable error when the list request fails', async ({ page }) => {
     const api = await installApi(page, { role: 'ADMIN' });
-    api.failAlways('GET /api/tasks/?', 500, fail('TASK_INTERNAL_ERROR', 'List failed.'));
+    api.failAlways('GET /api/tasks?', 500, fail('TASK_INTERNAL_ERROR', 'List failed.'));
     await bootApp(page);
     await openTaskManagement(page);
 
@@ -139,11 +139,11 @@ test.describe('Task list, filtering and sorting', () => {
   test('shows a loading state while the list is in flight', async ({ page }) => {
     const api = await installApi(page, { role: 'ADMIN' });
     await bootApp(page);
-    api.holdRoute('GET /api/tasks/?');
+    api.holdRoute('GET /api/tasks?');
     await (await appNav(page, 'task-management')).click();
 
     await expect(page.getByText('Loading tasks…')).toBeVisible();
-    api.releaseRoute('GET /api/tasks/?');
+    api.releaseRoute('GET /api/tasks?');
     await expect(taskItems(page)).toHaveCount(3);
   });
 });
@@ -176,7 +176,7 @@ test.describe('Task creation, editing and archiving', () => {
     // The field is required, so the browser blocks submission before any request is sent.
     await modal.getByRole('button', { name: /^(Create|Save)/ }).click();
     await expect(modal).toBeVisible();
-    expect(api.requests().filter(r => r === 'POST /api/tasks/')).toHaveLength(0);
+    expect(api.requests().filter(r => r === 'POST /api/tasks')).toHaveLength(0);
   });
 
   test('preserves typed values when the server rejects the create', async ({ page }) => {

@@ -387,7 +387,11 @@ export function createTaskRouter(): express.Router {
         });
     }
     if (row.outcome === 'started') {
-      await recordActivity(ctx, 'time_entry', row.entry_id, 'TIMER_STARTED', { taskId });
+      // Filed against the TASK, not the time entry. GET /:id/activity looks events up by the
+      // task's id, so an event stored under the entry's id is recorded but permanently
+      // unreachable — the drawer's Activity section would never show any timer history.
+      // The entry id is preserved in `detail` so the audit trail keeps the exact link.
+      await recordActivity(ctx, 'task', taskId, 'TIMER_STARTED', { entryId: row.entry_id });
     }
     ok(res, {
       entryId: row.entry_id, taskId: row.task_id, startedAt: row.started_at,
@@ -410,8 +414,8 @@ export function createTaskRouter(): express.Router {
     const row: any = Array.isArray(data) ? data[0] : data;
     if (!row) throw new TaskError(404, 'TASK_NO_ACTIVE_TIMER', 'No running timer to stop.');
     if (row.outcome === 'stopped') {
-      await recordActivity(ctx, 'time_entry', row.entry_id, 'TIMER_STOPPED',
-        { taskId: row.task_id, durationSeconds: row.duration_seconds });
+      await recordActivity(ctx, 'task', row.task_id, 'TIMER_STOPPED',
+        { entryId: row.entry_id, durationSeconds: row.duration_seconds });
     }
     ok(res, {
       entryId: row.entry_id, taskId: row.task_id, startedAt: row.started_at,
@@ -442,7 +446,7 @@ export function createTaskRouter(): express.Router {
       })
       .select('id, task_id, actor_id, started_at, ended_at, source, note').single();
     if (error) throw mapDbError(error, 'create manual entry');
-    await recordActivity(ctx, 'time_entry', data.id, 'MANUAL_TIME_ADDED', { taskId });
+    await recordActivity(ctx, 'task', taskId, 'MANUAL_TIME_ADDED', { entryId: data.id });
     ok(res, data);
   }, { requiresTimeTracking: true }));
 
@@ -473,7 +477,7 @@ export function createTaskRouter(): express.Router {
       .update(patch).eq('workspace_id', ctx.workspaceId).eq('id', id)
       .select('id, task_id, actor_id, started_at, ended_at, source, note, archived_at').single();
     if (error) throw mapDbError(error, 'update time entry');
-    await recordActivity(ctx, 'time_entry', id, 'TIME_ENTRY_UPDATED');
+    await recordActivity(ctx, 'task', data.task_id, 'TIME_ENTRY_UPDATED', { entryId: id });
     ok(res, data);
   }, { requiresTimeTracking: true }));
 
