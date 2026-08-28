@@ -282,11 +282,42 @@ export function formatDuration(totalSeconds: number): string {
   return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
 }
 
-/** Compact "2h 15m" style for summaries. */
+/**
+ * Compact "2h 15m" style, ESTIMATE-ONLY.
+ *
+ * time_estimate_seconds is a planning figure a person typed in round units, never a measured
+ * duration — so it deliberately stays coarse (no seconds shown) and always shows minutes even
+ * at :00, which reads as "a whole number of hours" rather than an ambiguous bare "2h". Do not
+ * repurpose this for tracked/actual time: use formatTrackedDuration for that, which is exact
+ * to the second and never collapses a real positive duration to the same string as "no data".
+ */
 export function formatTracked(totalSeconds: number): string {
   const s = Math.max(0, Math.floor(totalSeconds));
   if (s < 60) return `${s}s`;
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   return h ? `${h}h ${m}m` : `${m}m`;
+}
+
+/**
+ * Canonical formatter for ACTUAL tracked time (completed entries plus, where the caller
+ * includes it, the live elapsed seconds of a running timer). Exact to the second below one
+ * hour, so a 48-second task and a 61-second task are visibly different — unlike formatTracked,
+ * which would round both estimate-style. `undefined`/`null` are ONLY valid at the call site as
+ * "not yet known" and must never reach here as an implicit 0; callers should show a loading
+ * state instead. A genuine 0 is the only input that renders as "—", so a real positive
+ * duration — even 1 second — can never be mistaken for "no time recorded".
+ */
+export function formatTrackedDuration(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  if (s <= 0) return '—';
+  if (s < 60) return `${s}s`;
+  if (s < 3600) {
+    const m = Math.floor(s / 60);
+    const rem = s % 60;
+    return rem ? `${m}m ${rem}s` : `${m}m`;
+  }
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return m ? `${h}h ${m}m` : `${h}h`;
 }

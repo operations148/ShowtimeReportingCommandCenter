@@ -4,7 +4,7 @@ import {
 } from 'lucide-react';
 import {
   TaskApi, TaskApiError, TaskItem, TaskStatus, WorkspaceActor, TimeEntry, ActivityEvent,
-  formatTracked
+  formatTracked, formatTrackedDuration
 } from '../../tasks/apiClient';
 import { TimerToggleButton } from './ActiveTimerBar';
 import type { ActiveTimerState } from '../../hooks/useActiveTaskTimer';
@@ -258,7 +258,7 @@ export default function TaskDetailDrawer(p: Props) {
                   <div><dt className="text-slate-500 font-bold uppercase tracking-wider text-[9px]">Estimate</dt>
                     <dd className="text-slate-700 font-semibold">{task.time_estimate_seconds ? formatTracked(task.time_estimate_seconds) : '—'}</dd></div>
                   <div><dt className="text-slate-500 font-bold uppercase tracking-wider text-[9px]">Tracked</dt>
-                    <dd className="text-slate-700 font-semibold font-mono">{trackedSeconds ? formatTracked(trackedSeconds) : '—'}</dd></div>
+                    <dd className="text-slate-700 font-semibold font-mono">{formatTrackedDuration(trackedSeconds)}</dd></div>
                 </dl>
 
                 <div>
@@ -359,7 +359,7 @@ export default function TaskDetailDrawer(p: Props) {
                         <span className="flex items-center gap-2 shrink-0">
                           <span className="text-[11px] font-mono font-bold text-slate-600">
                             {e.ended_at
-                              ? formatTracked((Date.parse(e.ended_at) - Date.parse(e.started_at)) / 1000)
+                              ? formatTrackedDuration((Date.parse(e.ended_at) - Date.parse(e.started_at)) / 1000)
                               : 'running'}
                           </span>
                           {mutable && e.ended_at && (

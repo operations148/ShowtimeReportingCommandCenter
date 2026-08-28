@@ -3,7 +3,7 @@ import {
   Loader2, AlertTriangle, Inbox, ChevronLeft, ChevronRight, ListTree, Archive, RotateCcw
 } from 'lucide-react';
 import {
-  TaskItem, TaskStatus, WorkspaceActor, PageInfo, formatTracked
+  TaskItem, TaskStatus, WorkspaceActor, PageInfo, formatTracked, formatTrackedDuration
 } from '../../tasks/apiClient';
 import { TimerToggleButton } from './ActiveTimerBar';
 import type { ActiveTimerState } from '../../hooks/useActiveTaskTimer';
@@ -173,7 +173,7 @@ export default function TaskListView(p: Props) {
                       {fmtDate(t.due_date)}
                     </td>
                     <td className="p-4 text-[11px] font-mono font-bold text-slate-600 tabular-nums">
-                      {tracked ? formatTracked(tracked) : '—'}
+                      {formatTrackedDuration(tracked)}
                       {t.time_estimate_seconds ? (
                         <span className="text-slate-500 font-sans font-semibold">
                           {' '}/ {formatTracked(t.time_estimate_seconds)}
@@ -233,7 +233,7 @@ export default function TaskListView(p: Props) {
                   )}
                   {tracked > 0 && (
                     <span className="text-[10px] font-mono font-bold text-slate-500">
-                      {formatTracked(tracked)}
+                      {formatTrackedDuration(tracked)}
                     </span>
                   )}
                   {/* Archived state must be stated in text, not carried by opacity alone —
