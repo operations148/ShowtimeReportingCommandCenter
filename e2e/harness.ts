@@ -25,6 +25,7 @@ type ApiState = {
   statuses: any[];
   lists: any[];
   spaces: any[];
+  folders: any[];
   activeTimer: { id: string; task_id: string; started_at: string } | null;
   overrides: Map<string, { status: number; body: string; sticky?: boolean }>;
   hold: Set<string>;
@@ -81,6 +82,8 @@ export async function installApi(
     caps?: Record<string, unknown>;
     tasks?: any[];
     spaces?: any[];
+    folders?: any[];
+    lists?: any[];
   } = {}
 ): Promise<Harness> {
   const role = opts.role ?? 'ADMIN';
@@ -90,8 +93,9 @@ export async function installApi(
     caps: { ...F.capabilitiesFor(role), ...(opts.caps ?? {}) },
     tasks: JSON.parse(JSON.stringify(opts.tasks ?? F.tasks)),
     statuses: JSON.parse(JSON.stringify(F.statuses)),
-    lists: JSON.parse(JSON.stringify(F.lists)),
+    lists: JSON.parse(JSON.stringify(opts.lists ?? F.lists)),
     spaces: JSON.parse(JSON.stringify(opts.spaces ?? F.spaces)),
+    folders: JSON.parse(JSON.stringify(opts.folders ?? F.folders)),
     activeTimer: null,
     overrides: new Map(),
     hold: new Set(),
@@ -191,12 +195,7 @@ function handleTasks(
   if (method === 'GET' && seg[0] === 'bootstrap') {
     return [200, ok({
       spaces: s.spaces,
-      // Folders (migration 0009) have no UI yet in this phase, so the mock stays a static
-      // empty array rather than full mutable state — kept here only so this harness's
-      // bootstrap shape does not silently drift from the real server's, which always
-      // includes the key now. Give this its own ApiState.folders + CRUD handlers when a
-      // Folder UI needs to exercise the mock for real.
-      folders: [],
+      folders: s.folders,
       lists: s.lists,
       statuses: s.statuses,
       activeTimer: s.activeTimer,
@@ -334,11 +333,54 @@ function handleTasks(
       return [200, ok(row)];
     }
   }
+  // ---- Folders (migration 0009) ------------------------------------------
+  if (seg[0] === 'folders') {
+    if (method === 'POST') {
+      const name = String(body.name ?? '').trim();
+      if (!name) return [400, fail('TASK_VALIDATION_FAILED', 'name is required.')];
+      const row = {
+        id: `folder-new-${s.folders.length + 1}`, space_id: body.spaceId ?? F.SPACE_A,
+        name, description: body.description ?? null, position: 9000, version: 1, archived_at: null
+      };
+      s.folders.push(row);
+      return [201, ok(row)];
+    }
+    if (method === 'PATCH' && seg[1]) {
+      const row = s.folders.find((x) => x.id === seg[1]);
+      if (!row) return [404, fail('TASK_NOT_FOUND', 'Folder not found.')];
+      // Mirrors the router's non-empty-archive guard (TASK_FOLDER_NOT_EMPTY, 409): refuse
+      // archiving while a non-archived List still points at this Folder.
+      if (body.archived === true) {
+        const liveListCount = s.lists.filter((l) => l.folder_id === row.id && !l.archived_at).length;
+        if (liveListCount > 0) {
+          return [409, fail('TASK_FOLDER_NOT_EMPTY',
+            `This folder still has ${liveListCount} list${liveListCount === 1 ? '' : 's'} in it. Move or archive them first.`,
+            { listCount: liveListCount })];
+        }
+      }
+      if (body.name !== undefined) row.name = String(body.name).trim();
+      if (body.description !== undefined) row.description = body.description;
+      if (body.position !== undefined) row.position = body.position;
+      if (body.archived !== undefined) row.archived_at = body.archived ? now() : null;
+      row.version += 1;
+      return [200, ok(row)];
+    }
+  }
+
   if (seg[0] === 'lists') {
     if (method === 'POST') {
       const name = String(body.name ?? '').trim();
       if (!name) return [400, fail('TASK_VALIDATION_FAILED', 'name is required.')];
-      const row = { id: `list-new-${s.lists.length + 1}`, space_id: body.spaceId ?? F.SPACE_A,
+      const spaceId = body.spaceId ?? F.SPACE_A;
+      const folderId = body.folderId ?? null;
+      if (folderId) {
+        const folder = s.folders.find((f) => f.id === folderId);
+        if (!folder) return [404, fail('TASK_NOT_FOUND', 'Folder not found.')];
+        if (folder.space_id !== spaceId) {
+          return [422, fail('TASK_FOLDER_CROSS_SPACE', 'That folder belongs to a different Space and cannot be used here.')];
+        }
+      }
+      const row = { id: `list-new-${s.lists.length + 1}`, space_id: spaceId, folder_id: folderId,
                     name, position: 9000, is_default: false, version: 1, archived_at: null };
       s.lists.push(row);
       return [201, ok(row)];
@@ -347,7 +389,24 @@ function handleTasks(
       const row = s.lists.find((x) => x.id === seg[1]);
       if (!row) return [404, fail('TASK_NOT_FOUND', 'List not found.')];
       if (body.name !== undefined) row.name = String(body.name).trim();
+      if (body.position !== undefined) row.position = body.position;
       if (body.archived !== undefined) row.archived_at = body.archived ? now() : null;
+      // Move into/out of a Folder: omitted key = unchanged, null = Space root, id = that Folder.
+      // Mirrors the router's own same-Space validation (TASK_FOLDER_CROSS_SPACE, 422) and its
+      // exact `!== undefined` presence check — parseBody() below turns a truly absent JSON key
+      // into `undefined` on access, same as Express does server-side.
+      if (body.folderId !== undefined) {
+        if (body.folderId === null) {
+          row.folder_id = null;
+        } else {
+          const folder = s.folders.find((f) => f.id === body.folderId);
+          if (!folder) return [404, fail('TASK_NOT_FOUND', 'Folder not found.')];
+          if (folder.space_id !== row.space_id) {
+            return [422, fail('TASK_FOLDER_CROSS_SPACE', 'That folder belongs to a different Space and cannot be used here.')];
+          }
+          row.folder_id = folder.id;
+        }
+      }
       row.version += 1;
       return [200, ok(row)];
     }

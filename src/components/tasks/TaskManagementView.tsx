@@ -4,11 +4,12 @@ import {
 } from 'lucide-react';
 import { UserRole } from '../../types';
 import {
-  createTaskApi, TaskApiError, Bootstrap, TaskItem, TaskStatus, WorkspaceActor,
-  PageInfo, formatTracked
+  createTaskApi, TaskApiError, Bootstrap, TaskFolder, TaskItem, TaskList, TaskSpace, TaskStatus,
+  WorkspaceActor, PageInfo, formatTracked
 } from '../../tasks/apiClient';
 import { useActiveTaskTimer } from '../../hooks/useActiveTaskTimer';
-import TaskSidebar from './TaskSidebar';
+import TaskSidebar, { HierarchyAction } from './TaskSidebar';
+import HierarchyBreadcrumb from './HierarchyBreadcrumb';
 import TaskListView from './TaskListView';
 import TaskBoardView from './TaskBoardView';
 import TaskDetailDrawer from './TaskDetailDrawer';
@@ -16,6 +17,45 @@ import TaskFormModal from './TaskFormModal';
 import ActiveTimerBar from './ActiveTimerBar';
 import StatusManagerPanel from './StatusManagerPanel';
 import DialogPortal from './DialogPortal';
+
+const NAV_STORAGE_KEY = 'taskmgmt:nav';
+
+/**
+ * Restores the last-viewed Space/List and which Folders were left expanded.
+ *
+ * Not workspace-scoped: the client is deliberately never told its own workspace id (see
+ * apiClient.ts — "The workspace is NEVER sent"), so there is nothing to scope this key by.
+ * That is safe here because every restored id is re-validated against the freshly-loaded
+ * bootstrap data before use (below) — a stale id from a previous workspace just fails
+ * validation and falls back to the default selection, exactly like a stale id from the SAME
+ * workspace (e.g. something since archived) already would.
+ *
+ * Deliberately localStorage, not a URL query param: this app has no URL-based routing
+ * anywhere today (the active tab itself is plain component state), so real shareable deep
+ * links would require restoring the top-level tab too — a whole-app routing change well
+ * beyond this component's boundary. This restores your place WITHIN Task Management across a
+ * remount or a return visit to the tab.
+ */
+function readPersistedNav(): {
+  spaceId: string | null; listId: string | null;
+  expandedSpaceIds: string[]; expandedFolderIds: string[];
+} {
+  const empty = { spaceId: null, listId: null, expandedSpaceIds: [], expandedFolderIds: [] };
+  try {
+    const raw = localStorage.getItem(NAV_STORAGE_KEY);
+    if (!raw) return empty;
+    const parsed = JSON.parse(raw);
+    const strArr = (x: unknown) => Array.isArray(x) ? x.filter((v): v is string => typeof v === 'string') : [];
+    return {
+      spaceId: typeof parsed?.spaceId === 'string' ? parsed.spaceId : null,
+      listId: typeof parsed?.listId === 'string' ? parsed.listId : null,
+      expandedSpaceIds: strArr(parsed?.expandedSpaceIds),
+      expandedFolderIds: strArr(parsed?.expandedFolderIds)
+    };
+  } catch {
+    return empty;
+  }
+}
 
 interface Props {
   token: string;
@@ -35,8 +75,18 @@ export default function TaskManagementView({ token, role }: Props) {
   const [actors, setActors] = useState<WorkspaceActor[]>([]);
   const [banner, setBanner] = useState<string | null>(null);
 
-  const [spaceId, setSpaceId] = useState<string | null>(null);
-  const [listId, setListId] = useState<string | null>(null);
+  const [persistedNav] = useState(readPersistedNav);
+  const [spaceId, setSpaceId] = useState<string | null>(persistedNav.spaceId);
+  const [listId, setListId] = useState<string | null>(persistedNav.listId);
+  const [expandedSpaceIds, setExpandedSpaceIds] = useState<Set<string>>(
+    () => new Set(persistedNav.expandedSpaceIds)
+  );
+  const [expandedFolderIds, setExpandedFolderIds] = useState<Set<string>>(
+    () => new Set(persistedNav.expandedFolderIds)
+  );
+  /** Ids currently mid-mutation (including "temp-…" create placeholders) — the sidebar shows
+   *  a spinner on that specific row and disables it, rather than freezing the whole tree. */
+  const [pendingIds, setPendingIds] = useState<Set<string>>(new Set());
   const [view, setView] = useState<'list' | 'board'>('list');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
@@ -109,12 +159,53 @@ export default function TaskManagementView({ token, role }: Props) {
 
   useEffect(() => { loadBootstrap(); }, [loadBootstrap]);
 
-  // Default the List selection to the chosen Space's default List.
+  /**
+   * Validates the current (possibly localStorage-restored) Space against real data, falling
+   * back to the first non-archived Space when it is missing, archived, or from a different
+   * workspace than the one that just answered bootstrap. Also ensures the resolved Space is
+   * expanded, which covers both first load and a restored selection alike.
+   */
   useEffect(() => {
-    if (!boot || !spaceId || listId) return;
-    const inSpace = boot.lists.filter(l => l.space_id === spaceId && !l.archived_at);
-    setListId((inSpace.find(l => l.is_default) ?? inSpace[0])?.id ?? null);
+    if (!boot) return;
+    const valid = spaceId !== null && boot.spaces.some(s => s.id === spaceId && !s.archived_at);
+    const resolved = valid ? spaceId : (boot.spaces.find(s => !s.archived_at)?.id ?? null);
+    if (resolved !== spaceId) { setSpaceId(resolved); return; }
+    if (resolved) {
+      setExpandedSpaceIds(prev => prev.has(resolved) ? prev : new Set(prev).add(resolved));
+    }
+  }, [boot, spaceId]);
+
+  /**
+   * Same validation for the List within the now-resolved Space, defaulting to that Space's
+   * default List (or its first List) when the current one is missing, archived, or belongs to
+   * a different Space. When valid and inside a Folder, ensures that Folder is expanded too, so
+   * a restored selection is always visible in the tree, not hidden behind a collapsed Folder.
+   */
+  useEffect(() => {
+    if (!boot || !spaceId) return;
+    const current = listId ? boot.lists.find(l => l.id === listId) : undefined;
+    const valid = !!current && current.space_id === spaceId && !current.archived_at;
+    if (!valid) {
+      const inSpace = boot.lists.filter(l => l.space_id === spaceId && !l.archived_at);
+      setListId((inSpace.find(l => l.is_default) ?? inSpace[0])?.id ?? null);
+      return;
+    }
+    if (current!.folder_id) {
+      const fid = current!.folder_id;
+      setExpandedFolderIds(prev => prev.has(fid) ? prev : new Set(prev).add(fid));
+    }
   }, [boot, spaceId, listId]);
+
+  // Persist navigation state across a remount or a return visit — see readPersistedNav above.
+  useEffect(() => {
+    try {
+      localStorage.setItem(NAV_STORAGE_KEY, JSON.stringify({
+        spaceId, listId,
+        expandedSpaceIds: [...expandedSpaceIds],
+        expandedFolderIds: [...expandedFolderIds]
+      }));
+    } catch { /* storage unavailable (private mode, quota) — navigation still works, just not restored */ }
+  }, [spaceId, listId, expandedSpaceIds, expandedFolderIds]);
 
   /**
    * Debounce search so typing does not fire a request per keystroke.
@@ -181,6 +272,202 @@ export default function TaskManagementView({ token, role }: Props) {
 
   const refreshAll = useCallback(() => { loadTasks(); timer.refresh(); }, [loadTasks, timer]);
 
+  // ── Hierarchy mutations (optimistic, with rollback) ─────────────────────────────────
+  const bootRef = useRef<Bootstrap | null>(null);
+  bootRef.current = boot;
+
+  /**
+   * Applies an optimistic patch to `boot` immediately, then performs the real request.
+   * On success, silently refetches bootstrap in the background to reconcile — replacing any
+   * temp-id placeholder with the server's real row and correcting anything the optimistic
+   * patch approximated (e.g. a reordered position). On failure, rolls back to the exact
+   * pre-action snapshot, shows the server's error in the banner, and ALSO refetches — the
+   * snapshot being rolled back to may itself be stale (e.g. a 409 from someone else's
+   * concurrent edit), so the failure path re-syncs too rather than leaving a merely-reverted
+   * but still-outdated tree on screen.
+   */
+  const optimisticAction = useCallback(async (
+    targetId: string,
+    apply: (b: Bootstrap) => Bootstrap,
+    perform: () => Promise<unknown>,
+    fallbackMessage: string
+  ): Promise<boolean> => {
+    const snapshot = bootRef.current;
+    if (!snapshot) return false;
+    setBoot(apply(snapshot));
+    setPendingIds(prev => new Set(prev).add(targetId));
+    const clearPending = () => setPendingIds(prev => {
+      if (!prev.has(targetId)) return prev;
+      const next = new Set(prev); next.delete(targetId); return next;
+    });
+    try {
+      await perform();
+      clearPending();
+      loadBootstrap(true);
+      return true;
+    } catch (err: any) {
+      setBoot(snapshot);
+      clearPending();
+      setBanner(err?.message ?? fallbackMessage);
+      loadBootstrap(true);
+      return false;
+    }
+  }, [loadBootstrap]);
+
+  const handleHierarchyAction = useCallback(async (action: HierarchyAction): Promise<boolean> => {
+    const current = bootRef.current;
+    if (!current) return false;
+
+    switch (action.type) {
+      case 'createSpace': {
+        const tempId = `temp-${crypto.randomUUID()}`;
+        const optimistic: TaskSpace = { id: tempId, name: action.name, position: 1e9, version: 1, archived_at: null };
+        return optimisticAction(tempId,
+          b => ({ ...b, spaces: [...b.spaces, optimistic] }),
+          async () => {
+            const r = await api.createSpace(action.name);
+            setSpaceId(r.spaceId);
+            setExpandedSpaceIds(prev => new Set(prev).add(r.spaceId));
+            setListId(r.defaultListId);
+          },
+          'Could not create the Space.');
+      }
+
+      case 'createFolder': {
+        const tempId = `temp-${crypto.randomUUID()}`;
+        const optimistic: TaskFolder = {
+          id: tempId, space_id: action.spaceId, name: action.name, description: null,
+          position: 1e9, version: 1, archived_at: null
+        };
+        return optimisticAction(tempId,
+          b => ({ ...b, folders: [...b.folders, optimistic] }),
+          async () => {
+            const f = await api.createFolder({ spaceId: action.spaceId, name: action.name });
+            setExpandedFolderIds(prev => new Set(prev).add(f.id));
+          },
+          'Could not create the Folder.');
+      }
+
+      case 'createList': {
+        const tempId = `temp-${crypto.randomUUID()}`;
+        const optimistic: TaskList = {
+          id: tempId, space_id: action.spaceId, folder_id: action.folderId, name: action.name,
+          position: 1e9, is_default: false, version: 1, archived_at: null
+        };
+        return optimisticAction(tempId,
+          b => ({ ...b, lists: [...b.lists, optimistic] }),
+          async () => {
+            const l = await api.createList({ spaceId: action.spaceId, folderId: action.folderId ?? undefined, name: action.name });
+            setListId(l.id);
+          },
+          'Could not create the List.');
+      }
+
+      case 'renameSpace':
+        return optimisticAction(action.space.id,
+          b => ({ ...b, spaces: b.spaces.map(s => s.id === action.space.id ? { ...s, name: action.name } : s) }),
+          () => api.updateSpace(action.space.id, { name: action.name, version: action.space.version }),
+          'Could not rename the Space.');
+
+      case 'renameFolder':
+        return optimisticAction(action.folder.id,
+          b => ({ ...b, folders: b.folders.map(f => f.id === action.folder.id ? { ...f, name: action.name } : f) }),
+          () => api.updateFolder(action.folder.id, { name: action.name, version: action.folder.version }),
+          'Could not rename the Folder.');
+
+      case 'renameList':
+        return optimisticAction(action.list.id,
+          b => ({ ...b, lists: b.lists.map(l => l.id === action.list.id ? { ...l, name: action.name } : l) }),
+          () => api.updateList(action.list.id, { name: action.name, version: action.list.version }),
+          'Could not rename the List.');
+
+      case 'archiveToggleSpace': {
+        const archiving = !action.space.archived_at;
+        return optimisticAction(action.space.id,
+          b => ({ ...b, spaces: b.spaces.map(s => s.id === action.space.id
+            ? { ...s, archived_at: archiving ? new Date().toISOString() : null } : s) }),
+          () => api.updateSpace(action.space.id, { archived: archiving, version: action.space.version }),
+          'Could not update the Space.');
+      }
+
+      case 'archiveToggleFolder': {
+        const archiving = !action.folder.archived_at;
+        return optimisticAction(action.folder.id,
+          b => ({ ...b, folders: b.folders.map(f => f.id === action.folder.id
+            ? { ...f, archived_at: archiving ? new Date().toISOString() : null } : f) }),
+          () => api.updateFolder(action.folder.id, { archived: archiving, version: action.folder.version }),
+          // The server's TASK_FOLDER_NOT_EMPTY message ("This folder still has N list(s)…")
+          // already names the exact reason — no need for a separate generic fallback here
+          // beyond the one every action already has.
+          'Could not update the Folder.');
+      }
+
+      case 'archiveToggleList': {
+        const archiving = !action.list.archived_at;
+        return optimisticAction(action.list.id,
+          b => ({ ...b, lists: b.lists.map(l => l.id === action.list.id
+            ? { ...l, archived_at: archiving ? new Date().toISOString() : null } : l) }),
+          () => api.updateList(action.list.id, { archived: archiving, version: action.list.version }),
+          'Could not update the List.');
+      }
+
+      case 'reorderSpace': {
+        const siblings = current.spaces.filter(s => !s.archived_at).sort((a, b) => a.position - b.position);
+        const i = siblings.findIndex(x => x.id === action.space.id);
+        const j = i + action.dir;
+        if (i < 0 || j < 0 || j >= siblings.length) return false;
+        const target = siblings[j].position + (action.dir === 1 ? 1 : -1);
+        return optimisticAction(action.space.id,
+          b => ({ ...b, spaces: b.spaces.map(s => s.id === action.space.id ? { ...s, position: target } : s) }),
+          () => api.updateSpace(action.space.id, { position: target, version: action.space.version }),
+          'Could not reorder the Space.');
+      }
+
+      case 'reorderFolder': {
+        const siblings = current.folders
+          .filter(f => f.space_id === action.folder.space_id && !f.archived_at)
+          .sort((a, b) => a.position - b.position);
+        const i = siblings.findIndex(x => x.id === action.folder.id);
+        const j = i + action.dir;
+        if (i < 0 || j < 0 || j >= siblings.length) return false;
+        const target = siblings[j].position + (action.dir === 1 ? 1 : -1);
+        return optimisticAction(action.folder.id,
+          b => ({ ...b, folders: b.folders.map(f => f.id === action.folder.id ? { ...f, position: target } : f) }),
+          () => api.updateFolder(action.folder.id, { position: target, version: action.folder.version }),
+          'Could not reorder the Folder.');
+      }
+
+      case 'reorderList': {
+        // Siblings are scoped by (space_id, folder_id) together: a direct List and a List
+        // inside a Folder are never siblings, even sitting in the same Space, since each
+        // grouping has its own independent position sequence.
+        const siblings = current.lists.filter(l =>
+          l.space_id === action.list.space_id && l.folder_id === action.list.folder_id && !l.archived_at
+        ).sort((a, b) => a.position - b.position);
+        const i = siblings.findIndex(x => x.id === action.list.id);
+        const j = i + action.dir;
+        if (i < 0 || j < 0 || j >= siblings.length) return false;
+        const target = siblings[j].position + (action.dir === 1 ? 1 : -1);
+        return optimisticAction(action.list.id,
+          b => ({ ...b, lists: b.lists.map(l => l.id === action.list.id ? { ...l, position: target } : l) }),
+          () => api.updateList(action.list.id, { position: target, version: action.list.version }),
+          'Could not reorder the List.');
+      }
+
+      case 'moveList': {
+        if (action.list.folder_id === action.folderId) return true; // already there
+        if (action.folderId) {
+          const fid = action.folderId;
+          setExpandedFolderIds(prev => prev.has(fid) ? prev : new Set(prev).add(fid));
+        }
+        return optimisticAction(action.list.id,
+          b => ({ ...b, lists: b.lists.map(l => l.id === action.list.id ? { ...l, folder_id: action.folderId } : l) }),
+          () => api.updateList(action.list.id, { folderId: action.folderId, version: action.list.version }),
+          'Could not move the List.');
+      }
+    }
+  }, [api, optimisticAction]);
+
   const spaceStatuses = useMemo(
     () => (boot?.statuses ?? []).filter(s => s.space_id === spaceId),
     [boot, spaceId]
@@ -189,6 +476,17 @@ export default function TaskManagementView({ token, role }: Props) {
     () => (boot?.lists ?? []).filter(l => l.space_id === spaceId),
     [boot, spaceId]
   );
+  const selectedList = useMemo(
+    () => boot?.lists.find(l => l.id === listId),
+    [boot, listId]
+  );
+  const breadcrumb = useMemo(() => ({
+    spaceName: boot?.spaces.find(s => s.id === spaceId)?.name,
+    folderName: selectedList?.folder_id
+      ? boot?.folders.find(f => f.id === selectedList.folder_id)?.name
+      : null,
+    listName: selectedList?.name
+  }), [boot, spaceId, selectedList]);
   const taskTitleById = useCallback(
     (id: string) => tasks.find(t => t.id === id)?.title,
     [tasks]
@@ -331,16 +629,26 @@ export default function TaskManagementView({ token, role }: Props) {
         {/* Desktop sidebar */}
         <aside className="hidden lg:block bg-white border border-slate-200 rounded-xl p-4 h-fit sticky top-4">
           <TaskSidebar
-            api={api} spaces={boot!.spaces} lists={boot!.lists}
+            spaces={boot!.spaces} folders={boot!.folders} lists={boot!.lists}
             selectedSpaceId={spaceId} selectedListId={listId}
+            expandedSpaceIds={expandedSpaceIds} expandedFolderIds={expandedFolderIds}
+            pendingIds={pendingIds}
             canManage={caps.canManageHierarchy} showArchived={showArchived}
             onSelectSpace={id => { setSpaceId(id); setPage(1); }}
             onSelectList={id => { setListId(id); setPage(1); }}
-            onChanged={() => loadBootstrap(true)} onError={setBanner}
+            onToggleSpaceExpanded={id => setExpandedSpaceIds(prev => {
+              const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next;
+            })}
+            onToggleFolderExpanded={id => setExpandedFolderIds(prev => {
+              const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next;
+            })}
+            onAction={handleHierarchyAction}
           />
         </aside>
 
         <div className="min-w-0 space-y-3">
+          <HierarchyBreadcrumb {...breadcrumb} />
+
           {/* Toolbar */}
           <div className="bg-white border border-slate-200 rounded-xl p-3 space-y-2">
             <div className="flex flex-col sm:flex-row gap-2">
@@ -455,12 +763,20 @@ export default function TaskManagementView({ token, role }: Props) {
               </button>
             </div>
             <TaskSidebar
-              api={api} spaces={boot!.spaces} lists={boot!.lists}
+              spaces={boot!.spaces} folders={boot!.folders} lists={boot!.lists}
               selectedSpaceId={spaceId} selectedListId={listId}
+              expandedSpaceIds={expandedSpaceIds} expandedFolderIds={expandedFolderIds}
+              pendingIds={pendingIds}
               canManage={caps.canManageHierarchy} showArchived={showArchived}
               onSelectSpace={id => { setSpaceId(id); setPage(1); }}
               onSelectList={id => { setListId(id); setPage(1); setMobileNavOpen(false); }}
-              onChanged={() => loadBootstrap(true)} onError={setBanner}
+              onToggleSpaceExpanded={id => setExpandedSpaceIds(prev => {
+                const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next;
+              })}
+              onToggleFolderExpanded={id => setExpandedFolderIds(prev => {
+                const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next;
+              })}
+              onAction={handleHierarchyAction}
             />
           </div>
         </div>

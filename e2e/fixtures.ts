@@ -17,8 +17,12 @@ export const ACTOR_ME = '11111111-1111-4111-8111-111111111111';
 export const ACTOR_OTHER = '22222222-2222-4222-8222-222222222222';
 
 export const SPACE_A = '33333333-3333-4333-8333-333333333333';
+export const SPACE_B = '33333333-3333-4333-8333-333333333334';
 export const LIST_A = '44444444-4444-4444-8444-444444444444';
 export const LIST_B = '44444444-4444-4444-8444-444444444445';
+export const LIST_C = '44444444-4444-4444-8444-444444444446';
+export const LIST_D = '44444444-4444-4444-8444-444444444447';
+export const LIST_E = '44444444-4444-4444-8444-444444444448';
 
 export const STATUS_TODO = '55555555-5555-4555-8555-555555555551';
 export const STATUS_DOING = '55555555-5555-4555-8555-555555555552';
@@ -29,13 +33,32 @@ export const TASK_2 = '66666666-6666-4666-8666-666666666662';
 export const TASK_MINE = '66666666-6666-4666-8666-666666666663';
 export const SUBTASK_1 = '77777777-7777-4777-8777-777777777771';
 
+export const FOLDER_1 = '88888888-8888-4888-8888-888888888881';
+export const FOLDER_EMPTY = '88888888-8888-4888-8888-888888888882';
+export const FOLDER_ARCHIVED = '88888888-8888-4888-8888-888888888883';
+
 export const spaces = [
-  { id: SPACE_A, name: 'Delivery', position: 1000, version: 1, archived_at: null }
+  { id: SPACE_A, name: 'Delivery', position: 1000, version: 1, archived_at: null },
+  // A second Space, with its own default List, so "multiple Spaces" scenarios don't hit the
+  // unrelated pre-existing edge case of a Space with zero Lists (loadTasks omits listId
+  // entirely when null, which is a Task Management concern that predates Folders).
+  { id: SPACE_B, name: 'Marketing Ops', position: 2000, version: 1, archived_at: null }
+];
+
+export const folders = [
+  // Matches the target hierarchy's own example naming, so a test reading "Operations HQ"
+  // maps directly onto the PROMPT's own worked example.
+  { id: FOLDER_1, space_id: SPACE_A, name: 'Operations HQ', description: null, position: 1000, version: 1, archived_at: null },
+  { id: FOLDER_EMPTY, space_id: SPACE_A, name: 'Empty Folder', description: null, position: 2000, version: 1, archived_at: null },
+  { id: FOLDER_ARCHIVED, space_id: SPACE_A, name: 'Retired Folder', description: null, position: 3000, version: 1, archived_at: '2026-07-01T00:00:00.000Z' }
 ];
 
 export const lists = [
-  { id: LIST_A, space_id: SPACE_A, name: 'General', position: 1000, is_default: true, version: 1, archived_at: null },
-  { id: LIST_B, space_id: SPACE_A, name: 'Backlog', position: 2000, is_default: false, version: 1, archived_at: null }
+  { id: LIST_A, space_id: SPACE_A, folder_id: null, name: 'General', position: 1000, is_default: true, version: 1, archived_at: null },
+  { id: LIST_B, space_id: SPACE_A, folder_id: null, name: 'Backlog', position: 2000, is_default: false, version: 1, archived_at: null },
+  { id: LIST_C, space_id: SPACE_A, folder_id: FOLDER_1, name: 'Ann - GHL', position: 1000, is_default: false, version: 1, archived_at: null },
+  { id: LIST_D, space_id: SPACE_A, folder_id: FOLDER_1, name: 'Rome - Ads', position: 2000, is_default: false, version: 1, archived_at: null },
+  { id: LIST_E, space_id: SPACE_B, folder_id: null, name: 'General', position: 1000, is_default: true, version: 1, archived_at: null }
 ];
 
 export const statuses = [
@@ -91,7 +114,7 @@ export function capabilitiesFor(role: Role) {
 
 export function bootstrapFor(role: Role, over: Partial<any> = {}) {
   return {
-    spaces, lists, statuses,
+    spaces, folders, lists, statuses,
     activeTimer: null,
     capabilities: capabilitiesFor(role),
     ...over
