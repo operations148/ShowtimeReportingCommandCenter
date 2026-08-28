@@ -22,6 +22,10 @@ export type TaskErrorCode =
   | 'TASK_VERSION_CONFLICT'
   | 'TASK_TIMER_CONFLICT'
   | 'TASK_NO_ACTIVE_TIMER'
+  /** Archive refused: the Folder still has at least one non-archived List in it. */
+  | 'TASK_FOLDER_NOT_EMPTY'
+  /** The Folder named in the request belongs to a different Space than the List being moved. */
+  | 'TASK_FOLDER_CROSS_SPACE'
   | 'TASK_INTERNAL_ERROR';
 
 /**
@@ -73,6 +77,13 @@ export const invalid = (message: string, extra: Record<string, unknown> = {}) =>
 export const versionConflict = () =>
   new TaskError(409, 'TASK_VERSION_CONFLICT',
     'This record was modified by someone else. Reload and try again.');
+export const folderNotEmpty = (listCount: number) =>
+  new TaskError(409, 'TASK_FOLDER_NOT_EMPTY',
+    `This folder still has ${listCount} list${listCount === 1 ? '' : 's'} in it. ` +
+    'Move or archive them first.', { listCount });
+export const folderCrossSpace = () =>
+  new TaskError(422, 'TASK_FOLDER_CROSS_SPACE',
+    'That folder belongs to a different Space and cannot be used here.');
 
 /**
  * Wraps an async handler so thrown TaskErrors become contract responses and anything else

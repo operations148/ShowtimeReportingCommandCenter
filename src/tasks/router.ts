@@ -15,7 +15,8 @@ import express from 'express';
 import { supabaseAdmin } from '../supabase.js';
 import { UserRole } from '../types.js';
 import {
-  ok, fail, handler, TaskError, notFound, invalid, versionConflict, mapDbError, applyNoStore
+  ok, fail, handler, TaskError, notFound, invalid, versionConflict, mapDbError, applyNoStore,
+  folderNotEmpty, folderCrossSpace
 } from './http.js';
 import { isTaskManagementEnabled, isTaskTimeTrackingEnabled } from './config.js';
 import { assertWorkspaceInRollout, RolloutExemptOperation } from './rollout.js';
@@ -112,6 +113,26 @@ async function loadTask(ctx: Ctx, taskId: string) {
   return data as any;
 }
 
+/**
+ * Verifies a Folder exists in this workspace, belongs to the given Space, and is not
+ * archived — before it can be used as a List's parent. The Space is always the caller's
+ * List's CURRENT space_id, loaded fresh, never trusted from the request body: a List's Space
+ * is immutable through this API, so the only question is whether the named Folder lives in
+ * that same Space. This is the database's own composite FK (task_lists_folder_fk in
+ * migration 0009) enforced again here, earlier, so a mismatch is a clean, specific error
+ * rather than a raw constraint violation surfacing through mapDbError as a generic 404.
+ */
+async function loadFolderInSpace(ctx: Ctx, folderId: string, spaceId: string) {
+  const { data, error } = await supabaseAdmin.from('task_folders')
+    .select('id, space_id, archived_at')
+    .eq('workspace_id', ctx.workspaceId).eq('id', folderId).maybeSingle();
+  if (error) throw mapDbError(error, 'load folder');
+  if (!data) throw notFound('Folder');
+  if (data.space_id !== spaceId) throw folderCrossSpace();
+  if (data.archived_at) throw invalid('Cannot use an archived Folder. Restore it first.');
+  return data;
+}
+
 /** Current assignee actor ids for a task — read fresh, never trusted from the request. */
 async function loadAssigneeIds(ctx: Ctx, taskId: string): Promise<string[]> {
   const { data, error } = await supabaseAdmin
@@ -131,18 +152,21 @@ export function createTaskRouter(): express.Router {
   // One call returns the whole navigable hierarchy plus the caller's live timer, so the UI
   // does not issue a request per Space/List (N+1) on load.
   router.get('/bootstrap', guard('read', async (_req, res, ctx) => {
-    const [spaces, lists, statuses] = await Promise.all([
+    const [spaces, folders, lists, statuses] = await Promise.all([
       supabaseAdmin.from('task_spaces')
         .select('id, name, position, version, archived_at')
         .eq('workspace_id', ctx.workspaceId).order('position'),
+      supabaseAdmin.from('task_folders')
+        .select('id, space_id, name, description, position, version, archived_at')
+        .eq('workspace_id', ctx.workspaceId).order('position'),
       supabaseAdmin.from('task_lists')
-        .select('id, space_id, name, position, is_default, version, archived_at')
+        .select('id, space_id, folder_id, name, position, is_default, version, archived_at')
         .eq('workspace_id', ctx.workspaceId).order('position'),
       supabaseAdmin.from('task_statuses')
         .select('id, space_id, name, category, color, position, is_default, version, archived_at')
         .eq('workspace_id', ctx.workspaceId).order('position')
     ]);
-    for (const r of [spaces, lists, statuses]) {
+    for (const r of [spaces, folders, lists, statuses]) {
       if (r.error) throw mapDbError(r.error, 'bootstrap');
     }
 
@@ -157,6 +181,7 @@ export function createTaskRouter(): express.Router {
 
     ok(res, {
       spaces: spaces.data ?? [],
+      folders: folders.data ?? [],
       lists: lists.data ?? [],
       statuses: statuses.data ?? [],
       activeTimer,
@@ -238,6 +263,74 @@ export function createTaskRouter(): express.Router {
     ok(res, data[0]);
   }));
 
+  // ── Folders ─────────────────────────────────────────────────────────────────────────
+  // Optional grouping level between Space and List (migration 0009). A List with
+  // folder_id = NULL is a direct child of its Space — every List that existed before this
+  // feature, and every List a manager never explicitly moves, stays exactly there.
+  router.post('/folders', guard('mutate', async (req, res, ctx) => {
+    perm.assertCanManageHierarchy(ctx.role);
+    const spaceId = v.requireUuid(req.body?.spaceId, 'spaceId');
+    const name = v.requireString(req.body?.name, 'name', 1, 120);
+    const description = v.optionalString(req.body?.description, 'description', 2000);
+    const actor = requireResolvedActor(ctx.actor);
+
+    const { data, error } = await supabaseAdmin.from('task_folders')
+      .insert({
+        workspace_id: ctx.workspaceId, space_id: spaceId, name, description,
+        position: Number(req.body?.position ?? 1000),
+        created_by: actor.actorId, updated_by: actor.actorId
+      })
+      .select('id, space_id, name, description, position, version, archived_at').single();
+    if (error) throw mapDbError(error, 'create folder');
+    await recordActivity(ctx, 'folder', data.id, 'FOLDER_CREATED', { name });
+    ok(res, data);
+  }));
+
+  router.patch('/folders/:id', guard('mutate', async (req, res, ctx) => {
+    perm.assertCanManageHierarchy(ctx.role);
+    const id = v.requireUuid(req.params.id, 'id');
+    const version = v.requireVersion(req.body?.version);
+    const actor = requireResolvedActor(ctx.actor);
+
+    // Archiving is refused while the Folder still has live Lists in it. This is an explicit,
+    // visible precondition rather than an implicit cascade — a cascade would either archive
+    // Lists (and everything under them) the caller never asked to touch, or silently orphan
+    // them, neither of which this module does anywhere else for Spaces or Lists either.
+    // (There is a narrow theoretical race between this count and the update below — a List
+    // could be created into this Folder in between — but the outcome is a List that becomes
+    // hard to find until the Folder is restored, never data loss, and no other archive check
+    // in this module is transactionally locked either.)
+    if (req.body?.archived === true) {
+      const { count, error: cErr } = await supabaseAdmin.from('task_lists')
+        .select('id', { count: 'exact', head: true })
+        .eq('workspace_id', ctx.workspaceId).eq('folder_id', id).is('archived_at', null);
+      if (cErr) throw mapDbError(cErr, 'check folder contents');
+      if ((count ?? 0) > 0) throw folderNotEmpty(count!);
+    }
+
+    const patch: Record<string, unknown> = { updated_by: actor.actorId, version: version + 1 };
+    if (req.body?.name !== undefined) patch.name = v.requireString(req.body.name, 'name', 1, 120);
+    if (req.body?.description !== undefined) {
+      patch.description = v.optionalString(req.body.description, 'description', 2000);
+    }
+    if (req.body?.position !== undefined) patch.position = Number(req.body.position);
+    if (req.body?.archived === true) patch.archived_at = new Date().toISOString();
+    if (req.body?.archived === false) patch.archived_at = null;
+
+    const { data, error } = await supabaseAdmin.from('task_folders')
+      .update(patch)
+      .eq('workspace_id', ctx.workspaceId).eq('id', id).eq('version', version)
+      .select('id, space_id, name, description, position, version, archived_at');
+    if (error) throw mapDbError(error, 'update folder');
+    if (!data || data.length === 0) {
+      const { data: exists } = await supabaseAdmin.from('task_folders')
+        .select('id').eq('workspace_id', ctx.workspaceId).eq('id', id).maybeSingle();
+      throw exists ? versionConflict() : notFound('Folder');
+    }
+    await recordActivity(ctx, 'folder', id, 'FOLDER_UPDATED');
+    ok(res, data[0]);
+  }));
+
   // ── Lists ───────────────────────────────────────────────────────────────────────────
   router.post('/lists', guard('mutate', async (req, res, ctx) => {
     perm.assertCanManageHierarchy(ctx.role);
@@ -245,15 +338,23 @@ export function createTaskRouter(): express.Router {
     const name = v.requireString(req.body?.name, 'name', 1, 120);
     const actor = requireResolvedActor(ctx.actor);
 
+    // Optional at creation: omitted or null -> a direct child of the Space (unchanged
+    // default behaviour). A supplied id must be a Folder that already lives in this Space.
+    let folderId: string | null = null;
+    if (req.body?.folderId !== undefined && req.body.folderId !== null) {
+      folderId = v.requireUuid(req.body.folderId, 'folderId');
+      await loadFolderInSpace(ctx, folderId, spaceId);
+    }
+
     const { data, error } = await supabaseAdmin.from('task_lists')
       .insert({
-        workspace_id: ctx.workspaceId, space_id: spaceId, name,
+        workspace_id: ctx.workspaceId, space_id: spaceId, folder_id: folderId, name,
         position: Number(req.body?.position ?? 1000),
         created_by: actor.actorId, updated_by: actor.actorId
       })
-      .select('id, space_id, name, position, is_default, version, archived_at').single();
+      .select('id, space_id, folder_id, name, position, is_default, version, archived_at').single();
     if (error) throw mapDbError(error, 'create list');
-    await recordActivity(ctx, 'list', data.id, 'LIST_CREATED', { name });
+    await recordActivity(ctx, 'list', data.id, 'LIST_CREATED', { name, folderId });
     ok(res, data);
   }));
 
@@ -269,10 +370,28 @@ export function createTaskRouter(): express.Router {
     if (req.body?.archived === true) patch.archived_at = new Date().toISOString();
     if (req.body?.archived === false) patch.archived_at = null;
 
+    // Move into a Folder, or back to the Space root. A List's Space is immutable through this
+    // API, so the Folder (if any) must belong to the List's CURRENT space_id — loaded fresh
+    // here, never taken from the request, exactly like every other cross-reference check in
+    // this module.
+    if (req.body?.folderId !== undefined) {
+      if (req.body.folderId === null) {
+        patch.folder_id = null;
+      } else {
+        const folderId = v.requireUuid(req.body.folderId, 'folderId');
+        const { data: current, error: lErr } = await supabaseAdmin.from('task_lists')
+          .select('space_id').eq('workspace_id', ctx.workspaceId).eq('id', id).maybeSingle();
+        if (lErr) throw mapDbError(lErr, 'load list');
+        if (!current) throw notFound('List');
+        await loadFolderInSpace(ctx, folderId, current.space_id);
+        patch.folder_id = folderId;
+      }
+    }
+
     const { data, error } = await supabaseAdmin.from('task_lists')
       .update(patch)
       .eq('workspace_id', ctx.workspaceId).eq('id', id).eq('version', version)
-      .select('id, space_id, name, position, is_default, version, archived_at');
+      .select('id, space_id, folder_id, name, position, is_default, version, archived_at');
     if (error) throw mapDbError(error, 'update list');
     if (!data || data.length === 0) {
       const { data: exists } = await supabaseAdmin.from('task_lists')

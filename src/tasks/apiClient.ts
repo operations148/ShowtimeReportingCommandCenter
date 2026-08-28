@@ -20,7 +20,9 @@ export type TaskErrorCode =
   | 'TASK_TIME_TRACKING_DISABLED' | 'TASK_ACTOR_UNRESOLVED'
   | 'TASK_ENTITLEMENT_EXPIRED' | 'TASK_WORKSPACE_SUSPENDED' | 'TASK_FORBIDDEN'
   | 'TASK_NOT_FOUND' | 'TASK_VALIDATION_FAILED' | 'TASK_VERSION_CONFLICT'
-  | 'TASK_TIMER_CONFLICT' | 'TASK_NO_ACTIVE_TIMER' | 'TASK_INTERNAL_ERROR'
+  | 'TASK_TIMER_CONFLICT' | 'TASK_NO_ACTIVE_TIMER'
+  | 'TASK_FOLDER_NOT_EMPTY' | 'TASK_FOLDER_CROSS_SPACE'
+  | 'TASK_INTERNAL_ERROR'
   | 'TASK_UNAUTHENTICATED' | 'TASK_NETWORK';
 
 export type Priority = 'urgent' | 'high' | 'normal' | 'low';
@@ -30,8 +32,12 @@ export type TimeVisibility = 'team' | 'own' | 'aggregate_only';
 export interface TaskSpace {
   id: string; name: string; position: number; version: number; archived_at: string | null;
 }
+export interface TaskFolder {
+  id: string; space_id: string; name: string; description: string | null;
+  position: number; version: number; archived_at: string | null;
+}
 export interface TaskList {
-  id: string; space_id: string; name: string; position: number;
+  id: string; space_id: string; folder_id: string | null; name: string; position: number;
   is_default: boolean; version: number; archived_at: string | null;
 }
 export interface TaskStatus {
@@ -70,7 +76,7 @@ export interface Capabilities {
   timeVisibility: TimeVisibility; timeTrackingEnabled: boolean; actorResolved: boolean;
 }
 export interface Bootstrap {
-  spaces: TaskSpace[]; lists: TaskList[]; statuses: TaskStatus[];
+  spaces: TaskSpace[]; folders: TaskFolder[]; lists: TaskList[]; statuses: TaskStatus[];
   activeTimer: ActiveTimer | null; capabilities: Capabilities;
 }
 export interface PageInfo { page: number; pageSize: number; total: number; }
@@ -91,7 +97,8 @@ export class TaskApiError extends Error {
   get isTerminal(): boolean {
     return ['TASK_MODULE_DISABLED', 'TASK_ROLLOUT_EXCLUDED',
             'TASK_WORKSPACE_SUSPENDED', 'TASK_ACTOR_UNRESOLVED',
-            'TASK_FORBIDDEN', 'TASK_NOT_FOUND'].includes(this.code);
+            'TASK_FORBIDDEN', 'TASK_NOT_FOUND',
+            'TASK_FOLDER_NOT_EMPTY', 'TASK_FOLDER_CROSS_SPACE'].includes(this.code);
   }
 }
 
@@ -196,8 +203,15 @@ export function createTaskApi(getToken: () => string) {
     updateSpace: (id: string, body: Record<string, unknown>) =>
       request<TaskSpace>('PATCH', `/spaces/${id}`, { body }).then(r => r.data),
 
-    createList: (body: { spaceId: string; name: string; position?: number }) =>
+    createFolder: (body: { spaceId: string; name: string; description?: string }) =>
+      request<TaskFolder>('POST', '/folders', { body }).then(r => r.data),
+    /** `body.folderId`: omit to leave unchanged, `null` to move to the Space root, or a Folder id. */
+    updateFolder: (id: string, body: Record<string, unknown>) =>
+      request<TaskFolder>('PATCH', `/folders/${id}`, { body }).then(r => r.data),
+
+    createList: (body: { spaceId: string; folderId?: string | null; name: string; position?: number }) =>
       request<TaskList>('POST', '/lists', { body }).then(r => r.data),
+    /** `body.folderId`: omit to leave unchanged, `null` to move to the Space root, or a Folder id. */
     updateList: (id: string, body: Record<string, unknown>) =>
       request<TaskList>('PATCH', `/lists/${id}`, { body }).then(r => r.data),
 

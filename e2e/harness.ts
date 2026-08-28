@@ -191,6 +191,12 @@ function handleTasks(
   if (method === 'GET' && seg[0] === 'bootstrap') {
     return [200, ok({
       spaces: s.spaces,
+      // Folders (migration 0009) have no UI yet in this phase, so the mock stays a static
+      // empty array rather than full mutable state — kept here only so this harness's
+      // bootstrap shape does not silently drift from the real server's, which always
+      // includes the key now. Give this its own ApiState.folders + CRUD handlers when a
+      // Folder UI needs to exercise the mock for real.
+      folders: [],
       lists: s.lists,
       statuses: s.statuses,
       activeTimer: s.activeTimer,
