@@ -1,5 +1,6 @@
 import { test as base, expect, type Page, type Route } from '@playwright/test';
 import * as F from './fixtures';
+import { STATUS_TEMPLATES, findStatusTemplate, planStatusTemplate } from '../src/tasks/statusTemplates';
 
 /**
  * TEST-ONLY request interception harness.
@@ -90,6 +91,7 @@ export async function installApi(
     spaces?: any[];
     folders?: any[];
     lists?: any[];
+    statuses?: any[];
     timeEntries?: any[];
   } = {}
 ): Promise<Harness> {
@@ -99,7 +101,7 @@ export async function installApi(
     role,
     caps: { ...F.capabilitiesFor(role), ...(opts.caps ?? {}) },
     tasks: JSON.parse(JSON.stringify(opts.tasks ?? F.tasks)),
-    statuses: JSON.parse(JSON.stringify(F.statuses)),
+    statuses: JSON.parse(JSON.stringify(opts.statuses ?? F.statuses)),
     lists: JSON.parse(JSON.stringify(opts.lists ?? F.lists)),
     spaces: JSON.parse(JSON.stringify(opts.spaces ?? F.spaces)),
     folders: JSON.parse(JSON.stringify(opts.folders ?? F.folders)),
@@ -322,6 +324,48 @@ function handleTasks(
 
   // ---- Statuses ---------------------------------------------------------
   if (seg[0] === 'statuses') {
+    // Template routes are matched BEFORE the generic /statuses/:id handling below, exactly as
+    // the real router registers them as static paths.
+    if (method === 'GET' && seg[1] === 'templates') {
+      return [200, ok(STATUS_TEMPLATES.map((t) => ({
+        key: t.key, label: t.label, description: t.description, entries: t.entries
+      })))];
+    }
+    if (method === 'POST' && seg[1] === 'template' && (seg[2] === 'preview' || seg[2] === 'apply')) {
+      if (!s.caps.canManageHierarchy) {
+        return [403, fail('TASK_FORBIDDEN', 'Only a manager can change statuses.')];
+      }
+      const spaceId = body.spaceId ?? F.SPACE_A;
+      const tpl = findStatusTemplate(body.template ?? 'operations');
+      if (!tpl) return [400, fail('TASK_VALIDATION_FAILED', 'Unknown status template.')];
+
+      const inSpace = () => s.statuses.filter((x) => x.space_id === spaceId);
+      const counts = new Map<string, number>();
+      for (const st of inSpace()) {
+        counts.set(st.id, s.tasks.filter((t) => t.status_id === st.id).length);
+      }
+      // Planned from the SAME shared module the server uses, so the harness cannot drift from
+      // the real plan — only the persistence below is simulated.
+      const plan = planStatusTemplate(inSpace() as any, tpl, counts);
+
+      if (seg[2] === 'preview') return [200, ok({ dryRun: true, ...plan })];
+
+      for (const item of plan.items) {
+        if (item.action === 'create') {
+          s.statuses.push({
+            id: `status-tpl-${s.statuses.length + 1}`, space_id: spaceId, name: item.name,
+            category: item.category, color: item.color, position: item.position,
+            is_default: false, version: 1, archived_at: null
+          });
+        } else if (item.action === 'reuse' && item.statusId) {
+          const row = s.statuses.find((x) => x.id === item.statusId);
+          if (row) { row.position = item.position; row.archived_at = null; row.version += 1; }
+        }
+        // `keep` writes nothing at all — the guarantee the tests pin.
+      }
+      s.statuses.sort((a, b) => a.position - b.position);
+      return [200, ok({ applied: true, plan, statuses: inSpace() })];
+    }
     if (method === 'GET') {
       return [200, ok(s.statuses.filter((x) => x.space_id === (q.get('spaceId') ?? x.space_id)))];
     }
@@ -469,19 +513,29 @@ function handleTasks(
 
   // ---- Task collection --------------------------------------------------
   if (method === 'GET' && seg.length === 0) {
-    let rows = [...s.tasks];
-    if (q.get('rootOnly') === 'true') rows = rows.filter((t) => t.parent_task_id === null);
-    const listId = q.get('listId');
-    if (listId) rows = rows.filter((t) => t.list_id === listId);
-    const statusId = q.get('statusId');
-    if (statusId) rows = rows.filter((t) => t.status_id === statusId);
-    const priority = q.get('priority');
-    if (priority) rows = rows.filter((t) => t.priority === priority);
-    const search = q.get('q');
-    if (search) rows = rows.filter((t) => t.title.toLowerCase().includes(search.toLowerCase()));
-    const dueBefore = q.get('dueBefore');
-    if (dueBefore) rows = rows.filter((t) => t.due_date && t.due_date <= dueBefore);
-    if (q.get('includeArchived') !== 'true') rows = rows.filter((t) => !t.archived_at);
+    // ONE definition of the active query, exactly as the router factors it — so the page
+    // total and the per-status group counts can never describe different filter sets.
+    const matches = (t: any) => {
+      if (q.get('rootOnly') === 'true' && t.parent_task_id !== null) return false;
+      const listId = q.get('listId');
+      if (listId && t.list_id !== listId) return false;
+      const statusId = q.get('statusId');
+      if (statusId && t.status_id !== statusId) return false;
+      const priority = q.get('priority');
+      if (priority && t.priority !== priority) return false;
+      const search = q.get('q');
+      if (search && !t.title.toLowerCase().includes(search.toLowerCase())) return false;
+      const dueBefore = q.get('dueBefore');
+      if (dueBefore && !(t.due_date && t.due_date <= dueBefore)) return false;
+      // Server-side in the real router too: filtering assignees in the browser made
+      // `total` and every group count describe the unfiltered set.
+      const assignee = q.get('assigneeActorId');
+      if (assignee && !(t.assigneeActorIds ?? []).includes(assignee)) return false;
+      if (q.get('includeArchived') !== 'true' && t.archived_at) return false;
+      return true;
+    };
+
+    const rows = s.tasks.filter(matches);
 
     const rawSort = q.get('sort') ?? 'position';
     const desc = rawSort.startsWith('-');
@@ -496,8 +550,22 @@ function handleTasks(
     const pageNum = Math.max(1, Number(q.get('page') ?? 1));
     const pageSize = Math.max(1, Number(q.get('pageSize') ?? 50));
     const start = (pageNum - 1) * pageSize;
-    return [200, ok(rows.slice(start, start + pageSize),
-      { page: { page: pageNum, pageSize, total } })];
+
+    // Per-status totals across the WHOLE filtered set, not the page — same contract as the
+    // router's groupBy=status fan-out.
+    const extra: Record<string, unknown> = { page: { page: pageNum, pageSize, total } };
+    if (q.get('groupBy') === 'status') {
+      const spaceId = q.get('spaceId');
+      extra.groups = s.statuses
+        .filter((st) => !st.archived_at && (!spaceId || st.space_id === spaceId))
+        .sort((a, b) => a.position - b.position)
+        .map((st) => ({
+          statusId: st.id,
+          total: rows.filter((t) => t.status_id === st.id).length
+        }));
+    }
+
+    return [200, ok(rows.slice(start, start + pageSize), extra)];
   }
 
   if (method === 'POST' && seg.length === 0) {
@@ -585,6 +653,13 @@ function handleTasks(
     if (body.listId !== undefined) t.list_id = body.listId;
     if (body.priority !== undefined) t.priority = body.priority;
     if (body.dueDate !== undefined) t.due_date = body.dueDate;
+    // The router accepts `position` (manual ordering inside a status group); the harness
+    // silently dropped it, so a reorder round-tripped as a no-op here while working in
+    // production. Mirrored now, including the re-sort a position change implies.
+    if (body.position !== undefined) {
+      t.position = Number(body.position);
+      s.tasks.sort((a, b) => a.position - b.position);
+    }
     t.version += 1;
     t.updated_at = now();
     return [200, ok(t)];
@@ -593,11 +668,38 @@ function handleTasks(
   return null;
 }
 
-/** Seed a fake session token so SaaSAuthLayer renders the cockpit without a real login. */
-export async function bootApp(page: Page) {
+/**
+ * Seed a fake session token so SaaSAuthLayer renders the cockpit without a real login.
+ *
+ * Also seeds the List-layout preference to that of a RETURNING user — grouped layout, nothing
+ * collapsed, both fixture Spaces already initialised — unless `freshPrefs` is passed.
+ *
+ * Why: on a Space's first visit the grouped List collapses DONE-category groups by default.
+ * That is real, intended behaviour, but it is behaviour about *first visits*, and without this
+ * seed every unrelated test (permissions, contrast, reduced motion, archiving) would silently
+ * depend on it, since the shared fixture happens to put one of its three tasks in Done. Tests
+ * that are actually about the first-visit default opt in with `freshPrefs: true`.
+ *
+ * The seed is written only when the key is ABSENT, so it re-applies on a fresh context but
+ * never overwrites a preference the test itself just set — which is what makes the
+ * persistence-across-reload assertions meaningful.
+ */
+export async function bootApp(page: Page, opts: { freshPrefs?: boolean } = {}) {
   await page.addInitScript((tok) => {
     try { window.localStorage.setItem('saas_token', tok as string); } catch { /* ignore */ }
   }, F.FAKE_TOKEN);
+
+  if (!opts.freshPrefs) {
+    await page.addInitScript((spaceIds) => {
+      try {
+        if (window.localStorage.getItem('taskmgmt:list')) return;
+        window.localStorage.setItem('taskmgmt:list', JSON.stringify({
+          mode: 'grouped', collapsed: [], initialisedSpaceIds: spaceIds
+        }));
+      } catch { /* ignore */ }
+    }, [F.SPACE_A, F.SPACE_B]);
+  }
+
   await page.goto('/');
 }
 

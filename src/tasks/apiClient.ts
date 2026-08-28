@@ -81,6 +81,27 @@ export interface Bootstrap {
 }
 export interface PageInfo { page: number; pageSize: number; total: number; }
 
+/**
+ * Per-status totals for the status-grouped List view.
+ *
+ * Computed by the server across the WHOLE active query, not the page being viewed — so a
+ * group header's count is how many tasks match the current filters, which is the only figure
+ * that stays consistent once the result spans more than one page.
+ */
+export interface StatusGroupCount { statusId: string; total: number; }
+
+export type StatusTemplatePlanAction = 'reuse' | 'create' | 'keep';
+export interface StatusTemplatePlanItem {
+  action: StatusTemplatePlanAction;
+  name: string; category: string; color: string | null;
+  statusId?: string; position: number; taskCount?: number; note: string;
+}
+export interface StatusTemplatePlan {
+  templateKey: string; templateLabel: string;
+  items: StatusTemplatePlanItem[];
+  createCount: number; reuseCount: number; keepCount: number; noop: boolean;
+}
+
 /** Normalised failure. Every rejection from this client is one of these. */
 export class TaskApiError extends Error {
   constructor(
@@ -176,9 +197,14 @@ export function createTaskApi(getToken: () => string) {
     statuses: (spaceId: string, signal?: AbortSignal) =>
       request<TaskStatus[]>('GET', '/statuses', { query: { spaceId }, signal }).then(r => r.data),
 
+    /** `groups` is present only when the caller asked for `groupBy: 'status'` (with a spaceId). */
     listTasks: (query: Record<string, any>, signal?: AbortSignal) =>
       request<TaskItem[]>('GET', '/', { query, signal })
-        .then(r => ({ tasks: r.data ?? [], page: r.page })),
+        .then(r => ({
+          tasks: r.data ?? [],
+          page: r.page,
+          groups: r.raw?.groups as StatusGroupCount[] | undefined
+        })),
 
     getTask: (id: string, signal?: AbortSignal) =>
       request<TaskItem>('GET', `/${id}`, { signal }).then(r => r.data),
@@ -219,6 +245,18 @@ export function createTaskApi(getToken: () => string) {
       request<TaskStatus>('POST', '/statuses', { body }).then(r => r.data),
     updateStatus: (id: string, body: Record<string, unknown>) =>
       request<TaskStatus>('PATCH', `/statuses/${id}`, { body }).then(r => r.data),
+
+    /**
+     * Dry-run: returns exactly what applying the template WOULD do, having written nothing.
+     * The UI must show this and take a second, explicit confirmation before calling apply.
+     */
+    previewStatusTemplate: (spaceId: string, template = 'operations') =>
+      request<StatusTemplatePlan & { dryRun: true }>(
+        'POST', '/statuses/template/preview', { body: { spaceId, template } }).then(r => r.data),
+
+    applyStatusTemplate: (spaceId: string, template = 'operations') =>
+      request<{ applied: true; plan: StatusTemplatePlan; statuses: TaskStatus[] }>(
+        'POST', '/statuses/template/apply', { body: { spaceId, template } }).then(r => r.data),
 
     // Tasks
     createTask: (body: Record<string, unknown>) =>

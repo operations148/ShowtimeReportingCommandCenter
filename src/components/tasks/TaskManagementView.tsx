@@ -5,12 +5,13 @@ import {
 import { UserRole } from '../../types';
 import {
   createTaskApi, TaskApiError, Bootstrap, TaskFolder, TaskItem, TaskList, TaskSpace, TaskStatus,
-  WorkspaceActor, PageInfo, formatTracked
+  WorkspaceActor, PageInfo, StatusGroupCount, formatTracked
 } from '../../tasks/apiClient';
 import { useActiveTaskTimer } from '../../hooks/useActiveTaskTimer';
 import TaskSidebar, { HierarchyAction } from './TaskSidebar';
 import HierarchyBreadcrumb from './HierarchyBreadcrumb';
 import TaskListView from './TaskListView';
+import TaskGroupedListView from './TaskGroupedListView';
 import TaskBoardView from './TaskBoardView';
 import TaskDetailDrawer from './TaskDetailDrawer';
 import TaskFormModal from './TaskFormModal';
@@ -57,6 +58,40 @@ function readPersistedNav(): {
   }
 }
 
+const LIST_STORAGE_KEY = 'taskmgmt:list';
+
+export type ListMode = 'grouped' | 'flat';
+
+/**
+ * The user's List-layout preference: grouped or flat, and which status groups they have
+ * collapsed.
+ *
+ * `initialisedSpaceIds` records which Spaces have already had their one-time default applied
+ * (DONE-category groups start collapsed). Without it there is no way to distinguish "the user
+ * deliberately expanded DONE" from "we have not defaulted this Space yet", and every reload
+ * would re-collapse a group the user had just opened. Per-Space, because a Space the user has
+ * never visited still deserves the default.
+ */
+function readPersistedList(): {
+  mode: ListMode; collapsed: string[]; initialisedSpaceIds: string[];
+} {
+  const empty = { mode: 'grouped' as ListMode, collapsed: [], initialisedSpaceIds: [] };
+  try {
+    const raw = localStorage.getItem(LIST_STORAGE_KEY);
+    if (!raw) return empty;
+    const parsed = JSON.parse(raw);
+    const strArr = (x: unknown) =>
+      Array.isArray(x) ? x.filter((v): v is string => typeof v === 'string') : [];
+    return {
+      mode: parsed?.mode === 'flat' ? 'flat' : 'grouped',
+      collapsed: strArr(parsed?.collapsed),
+      initialisedSpaceIds: strArr(parsed?.initialisedSpaceIds)
+    };
+  } catch {
+    return empty;
+  }
+}
+
 interface Props {
   token: string;
   role: UserRole;
@@ -88,6 +123,12 @@ export default function TaskManagementView({ token, role }: Props) {
    *  a spinner on that specific row and disables it, rather than freezing the whole tree. */
   const [pendingIds, setPendingIds] = useState<Set<string>>(new Set());
   const [view, setView] = useState<'list' | 'board'>('list');
+  const [persistedList] = useState(readPersistedList);
+  const [listMode, setListMode] = useState<ListMode>(persistedList.mode);
+  const [collapsedStatusIds, setCollapsedStatusIds] =
+    useState<Set<string>>(() => new Set(persistedList.collapsed));
+  const [initialisedSpaceIds, setInitialisedSpaceIds] =
+    useState<Set<string>>(() => new Set(persistedList.initialisedSpaceIds));
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   // Filters
@@ -106,6 +147,7 @@ export default function TaskManagementView({ token, role }: Props) {
   const [tasksLoading, setTasksLoading] = useState(false);
   const [tasksError, setTasksError] = useState<string | null>(null);
   const [trackedByTask, setTracked] = useState<Map<string, number>>(new Map());
+  const [groupCounts, setGroupCounts] = useState<StatusGroupCount[] | undefined>();
 
   const [openTaskId, setOpenTaskId] = useState<string | null>(null);
   const [formState, setFormState] = useState<
@@ -207,6 +249,36 @@ export default function TaskManagementView({ token, role }: Props) {
     } catch { /* storage unavailable (private mode, quota) — navigation still works, just not restored */ }
   }, [spaceId, listId, expandedSpaceIds, expandedFolderIds]);
 
+  // Persist the List layout preference — see readPersistedList above.
+  useEffect(() => {
+    try {
+      localStorage.setItem(LIST_STORAGE_KEY, JSON.stringify({
+        mode: listMode,
+        collapsed: [...collapsedStatusIds],
+        initialisedSpaceIds: [...initialisedSpaceIds]
+      }));
+    } catch { /* storage unavailable — the preference just does not survive the session */ }
+  }, [listMode, collapsedStatusIds, initialisedSpaceIds]);
+
+  /**
+   * One-time default per Space: DONE-category groups start collapsed, so a List whose closed
+   * work outnumbers its open work still opens on the open work. The group header, its colour
+   * and its true count stay on screen either way — collapsing hides rows, never the fact that
+   * they exist. Runs once per Space and never again, so a later manual expand sticks.
+   */
+  useEffect(() => {
+    if (!boot || !spaceId || initialisedSpaceIds.has(spaceId)) return;
+    const doneIds = boot.statuses
+      .filter(s => s.space_id === spaceId && s.category === 'done' && !s.archived_at)
+      .map(s => s.id);
+    setCollapsedStatusIds(prev => {
+      const next = new Set(prev);
+      for (const id of doneIds) next.add(id);
+      return next;
+    });
+    setInitialisedSpaceIds(prev => new Set(prev).add(spaceId));
+  }, [boot, spaceId, initialisedSpaceIds]);
+
   /**
    * Debounce search so typing does not fire a request per keystroke.
    *
@@ -229,27 +301,33 @@ export default function TaskManagementView({ token, role }: Props) {
     const seq = ++reqSeq.current;
     const ac = new AbortController();
     setTasksLoading(true); setTasksError(null);
+    const grouped = view === 'list' && listMode === 'grouped';
     try {
-      const { tasks: rows, page: pi } = await api.listTasks({
+      const { tasks: rows, page: pi, groups } = await api.listTasks({
         listId: listId ?? undefined,
         statusId: statusFilter || undefined,
         priority: priorityFilter || undefined,
+        // Server-side (see router GET /): applying it in the browser filtered only the current
+        // page, so `page.total` and every group count described the UNfiltered set.
+        assigneeActorId: assigneeFilter || undefined,
         q: debouncedSearch || undefined,
         dueBefore: dueBefore ? new Date(`${dueBefore}T23:59:59Z`).toISOString() : undefined,
         includeArchived: showArchived ? 'true' : undefined,
         // The board needs every status column at once, so it does not filter to root-only.
+        // The grouped List does: a subtask must never surface as a root task in a group.
         rootOnly: view === 'list' ? 'true' : undefined,
+        // Per-status totals across the whole query, so a group count is not just "what landed
+        // on this page". Needs the Space, since statuses are Space-scoped.
+        groupBy: grouped && spaceId ? 'status' : undefined,
+        spaceId: grouped && spaceId ? spaceId : undefined,
         sort, page, pageSize: view === 'board' ? 200 : 50
       }, ac.signal);
       // Ignore a response that a newer request has already superseded.
       if (seq !== reqSeq.current) return;
 
-      let visible = rows;
-      if (assigneeFilter) {
-        visible = rows.filter(t => t.assigneeActorIds.includes(assigneeFilter));
-      }
-      setTasks(visible);
+      setTasks(rows);
       setPageInfo(pi);
+      setGroupCounts(groups);
 
       if (timeTrackingEnabled) {
         try {
@@ -266,7 +344,7 @@ export default function TaskManagementView({ token, role }: Props) {
       if (seq === reqSeq.current) setTasksLoading(false);
     }
   }, [api, boot, listId, statusFilter, priorityFilter, debouncedSearch, dueBefore,
-      showArchived, sort, page, view, assigneeFilter, timeTrackingEnabled]);
+      showArchived, sort, page, view, listMode, spaceId, assigneeFilter, timeTrackingEnabled]);
 
   useEffect(() => { loadTasks(); }, [loadTasks]);
 
@@ -497,6 +575,15 @@ export default function TaskManagementView({ token, role }: Props) {
     () => (boot?.lists ?? []).filter(l => l.space_id === spaceId),
     [boot, spaceId]
   );
+  /** The status groups the List renders, in the Space's own display order. */
+  const openStatuses = useMemo(
+    () => spaceStatuses.filter(s => !s.archived_at).sort((a, b) => a.position - b.position),
+    [spaceStatuses]
+  );
+  /** Drives the empty-state wording: "nothing matches" reads very differently from "empty". */
+  const filtersActive = !!(
+    debouncedSearch || statusFilter || priorityFilter || assigneeFilter || dueBefore
+  );
   const selectedList = useMemo(
     () => boot?.lists.find(l => l.id === listId),
     [boot, listId]
@@ -517,12 +604,57 @@ export default function TaskManagementView({ token, role }: Props) {
     try {
       await api.updateTask(t.id, { version: t.version, statusId });
     } catch (err: any) {
+      // Shared by the Board and the grouped List now, so the wording names neither.
       setBanner(err instanceof TaskApiError && err.code === 'TASK_VERSION_CONFLICT'
-        ? 'That task changed elsewhere — the board has been refreshed.'
+        ? 'That task changed elsewhere — it has been refreshed.'
         : err?.message ?? 'Could not move the task.');
     } finally {
       // Always refetch authoritative state; never leave an unconfirmed change on screen.
       loadTasks();
+    }
+  };
+
+  /**
+   * Manual ordering inside a status group.
+   *
+   * Siblings are the tasks in the SAME status, so ordering is per-group rather than across the
+   * whole List — moving the top item of IN PROGRESS up must not shuffle it into TO DO. Uses
+   * the same neighbour-position idiom as the hierarchy sidebar, and the same version-checked
+   * update as every other task mutation, so a concurrent edit still fails as a clean 409.
+   */
+  const reorderTask = async (t: TaskItem, dir: -1 | 1) => {
+    const siblings = tasks
+      .filter(x => x.status_id === t.status_id && !x.archived_at)
+      .sort((a, b) => a.position - b.position);
+    const i = siblings.findIndex(x => x.id === t.id);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= siblings.length) return;
+    const target = siblings[j].position + (dir === 1 ? 1 : -1);
+    try {
+      await api.updateTask(t.id, { version: t.version, position: target });
+    } catch (err: any) {
+      setBanner(err instanceof TaskApiError && err.code === 'TASK_VERSION_CONFLICT'
+        ? 'That task changed elsewhere — the list has been refreshed.'
+        : err?.message ?? 'Could not reorder the task.');
+    } finally {
+      loadTasks();
+    }
+  };
+
+  /**
+   * Inline creation from a group header, with that group's status preselected — the whole
+   * point of the affordance, so the status is passed explicitly rather than falling back to
+   * the Space default the modal would use.
+   */
+  const inlineCreate = async (statusId: string, title: string): Promise<boolean> => {
+    if (!listId) return false;
+    try {
+      await api.createTask({ listId, statusId, title });
+      loadTasks();
+      return true;
+    } catch (err: any) {
+      setBanner(err?.message ?? 'Could not create the task.');
+      return false;
     }
   };
 
@@ -742,10 +874,46 @@ export default function TaskManagementView({ token, role }: Props) {
                   className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-3.5 h-3.5" />
                 Show archived
               </label>
+
+              {/* Layout choice for the List view only — the Board is already status-grouped. */}
+              {view === 'list' && (
+                <div className="flex gap-1 ml-auto" role="group" aria-label="Choose a List layout">
+                  {([['grouped', 'Grouped'], ['flat', 'Flat']] as const).map(([m, label]) => (
+                    <button
+                      key={m} onClick={() => { setListMode(m); setPage(1); }}
+                      aria-pressed={listMode === m}
+                      className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition-colors cursor-pointer focus-visible:ring-2 focus-visible:ring-blue-300 focus-visible:outline-none ${
+                        listMode === m
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
 
-          {view === 'list' ? (
+          {view === 'list' && listMode === 'grouped' ? (
+            <TaskGroupedListView
+              tasks={tasks} statuses={openStatuses} groupCounts={groupCounts}
+              page={pageInfo} loading={tasksLoading} error={tasksError}
+              actors={actors} trackedByTask={trackedByTask}
+              timer={timer} timeTrackingEnabled={timeTrackingEnabled}
+              canMutate={canMutate} canCreateTask={caps.canCreateTask}
+              manualOrder={sort === 'position'}
+              collapsedStatusIds={collapsedStatusIds}
+              filtered={filtersActive}
+              onToggleCollapsed={id => setCollapsedStatusIds(prev => {
+                const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next;
+              })}
+              onOpenTask={setOpenTaskId} onArchiveToggle={archiveToggle}
+              onMoveTask={moveTask} onReorderTask={reorderTask} onInlineCreate={inlineCreate}
+              onPageChange={setPage} onRetry={loadTasks}
+            />
+          ) : view === 'list' ? (
             <TaskListView
               tasks={tasks} page={pageInfo} loading={tasksLoading} error={tasksError}
               statuses={boot!.statuses} actors={actors} trackedByTask={trackedByTask}

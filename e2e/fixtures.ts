@@ -67,6 +67,34 @@ export const statuses = [
   { id: STATUS_DONE, space_id: SPACE_A, name: 'Done', category: 'done', color: '#059669', position: 3000, is_default: false, version: 1, archived_at: null }
 ];
 
+/**
+ * The seven Operations Status Template statuses, as a Space that has already had the template
+ * applied. Ids are stable so a test can address a specific group.
+ *
+ * Deliberately a SEPARATE fixture rather than a replacement for `statuses` above: the default
+ * three-status Space is what every pre-existing test is written against, and the template is
+ * an opt-in operation, never something a Space acquires implicitly.
+ */
+export const OPS_STATUS_IDS = {
+  todo: '5a555555-5555-4555-8555-555555555551',
+  inProgress: '5a555555-5555-4555-8555-555555555552',
+  waiting: '5a555555-5555-4555-8555-555555555553',
+  review: '5a555555-5555-4555-8555-555555555554',
+  done: '5a555555-5555-4555-8555-555555555555',
+  blocked: '5a555555-5555-4555-8555-555555555556',
+  toSchedule: '5a555555-5555-4555-8555-555555555557'
+};
+
+export const operationsStatuses = [
+  { id: OPS_STATUS_IDS.todo, space_id: SPACE_A, name: 'TO DO', category: 'todo', color: '#94A3B8', position: 1000, is_default: true, version: 1, archived_at: null },
+  { id: OPS_STATUS_IDS.inProgress, space_id: SPACE_A, name: 'IN PROGRESS', category: 'in_progress', color: '#2563EB', position: 2000, is_default: false, version: 1, archived_at: null },
+  { id: OPS_STATUS_IDS.waiting, space_id: SPACE_A, name: 'WAITING', category: 'in_progress', color: '#D97706', position: 3000, is_default: false, version: 1, archived_at: null },
+  { id: OPS_STATUS_IDS.review, space_id: SPACE_A, name: 'REVIEW', category: 'in_progress', color: '#7C3AED', position: 4000, is_default: false, version: 1, archived_at: null },
+  { id: OPS_STATUS_IDS.done, space_id: SPACE_A, name: 'DONE', category: 'done', color: '#059669', position: 5000, is_default: false, version: 1, archived_at: null },
+  { id: OPS_STATUS_IDS.blocked, space_id: SPACE_A, name: 'BLOCKED', category: 'in_progress', color: '#DC2626', position: 6000, is_default: false, version: 1, archived_at: null },
+  { id: OPS_STATUS_IDS.toSchedule, space_id: SPACE_A, name: 'TO SCHEDULE', category: 'todo', color: '#0891B2', position: 7000, is_default: false, version: 1, archived_at: null }
+];
+
 export const actors = [
   { actorId: ACTOR_ME, displayName: 'Dana Tester', email: 'dana@example.test', archived: false, isSelf: true },
   { actorId: ACTOR_OTHER, displayName: 'Sam Colleague', email: 'sam@example.test', archived: false, isSelf: false }

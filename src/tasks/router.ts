@@ -26,6 +26,9 @@ import {
 } from './entitlement.js';
 import * as perm from './permissions.js';
 import * as v from './validation.js';
+import {
+  findStatusTemplate, planStatusTemplate, STATUS_TEMPLATES, ExistingStatus
+} from './statusTemplates.js';
 
 interface Ctx {
   workspaceId: string;
@@ -467,6 +470,102 @@ export function createTaskRouter(): express.Router {
     ok(res, data[0]);
   }));
 
+  // ── Status templates ────────────────────────────────────────────────────────────────
+  /**
+   * A template is NEVER applied implicitly. Space creation seeds its own defaults and is not
+   * touched by any of this; the only way a template reaches a Space is a manager calling
+   * /statuses/template/apply, and the UI only offers that after showing the dry-run below.
+   */
+
+  router.get('/statuses/templates', guard('read', async (_req, res, _ctx) => {
+    ok(res, STATUS_TEMPLATES.map(t => ({
+      key: t.key, label: t.label, description: t.description, entries: t.entries
+    })));
+  }));
+
+  /** Loads the Space's statuses plus a task count per status — the input the planner needs. */
+  async function loadTemplateInputs(ctx: Ctx, spaceId: string) {
+    const { data: statuses, error } = await supabaseAdmin.from('task_statuses')
+      .select('id, space_id, name, category, color, position, is_default, version, archived_at')
+      .eq('workspace_id', ctx.workspaceId).eq('space_id', spaceId).order('position');
+    if (error) throw mapDbError(error, 'load statuses');
+    const rows = (statuses ?? []) as any[];
+
+    const counts = new Map<string, number>();
+    await Promise.all(rows.map(async (s: any) => {
+      const { count, error: cErr } = await supabaseAdmin.from('task_items')
+        .select('id', { count: 'exact', head: true })
+        .eq('workspace_id', ctx.workspaceId).eq('status_id', s.id);
+      if (cErr) throw mapDbError(cErr, 'status task count');
+      counts.set(s.id, count ?? 0);
+    }));
+
+    return { rows, counts };
+  }
+
+  function requireTemplate(raw: unknown) {
+    const tpl = findStatusTemplate(raw ?? 'operations');
+    if (!tpl) throw invalid('Unknown status template.');
+    return tpl;
+  }
+
+  // Dry-run. Reads only — this route performs no writes under any input.
+  router.post('/statuses/template/preview', guard('read', async (req, res, ctx) => {
+    perm.assertCanManageHierarchy(ctx.role);
+    const spaceId = v.requireUuid(req.body?.spaceId, 'spaceId');
+    const tpl = requireTemplate(req.body?.template);
+    const { rows, counts } = await loadTemplateInputs(ctx, spaceId);
+    ok(res, { dryRun: true, ...planStatusTemplate(rows as ExistingStatus[], tpl, counts) });
+  }));
+
+  router.post('/statuses/template/apply', guard('mutate', async (req, res, ctx) => {
+    perm.assertCanManageHierarchy(ctx.role);
+    const spaceId = v.requireUuid(req.body?.spaceId, 'spaceId');
+    const tpl = requireTemplate(req.body?.template);
+
+    const { rows, counts } = await loadTemplateInputs(ctx, spaceId);
+    const plan = planStatusTemplate(rows as ExistingStatus[], tpl, counts);
+
+    // Inserts first, so a failure part-way leaves extra statuses rather than a Space whose
+    // ordering was rewritten to match a template that was never fully created.
+    for (const item of plan.items) {
+      if (item.action !== 'create') continue;
+      const { error } = await supabaseAdmin.from('task_statuses').insert({
+        workspace_id: ctx.workspaceId, space_id: spaceId,
+        name: item.name, category: item.category, color: item.color, position: item.position
+      });
+      if (error) throw mapDbError(error, 'create status from template');
+    }
+
+    /**
+     * Reused rows are re-ordered (and un-archived) in place by id. Nothing is deleted, no
+     * status_id changes, and no task row is written — so every task already sitting in a
+     * reused status keeps pointing at exactly the same status it did before.
+     *
+     * `keep` items are deliberately NOT written at all: a status outside the template is left
+     * completely untouched, including its position, whether or not it holds tasks.
+     */
+    for (const item of plan.items) {
+      if (item.action !== 'reuse' || !item.statusId) continue;
+      const current = rows.find((r: any) => r.id === item.statusId);
+      if (!current) continue;
+      if (current.position === item.position && !current.archived_at) continue;
+      const { error } = await supabaseAdmin.from('task_statuses')
+        .update({ position: item.position, archived_at: null, version: current.version + 1 })
+        .eq('workspace_id', ctx.workspaceId).eq('id', item.statusId);
+      if (error) throw mapDbError(error, 'reorder status from template');
+    }
+
+    // Logged against the SPACE, not a status: the event describes the Space's status set as a
+    // whole, and 'space' is already an allowed entity_type — so this needs no migration.
+    await recordActivity(ctx, 'space', spaceId, 'STATUS_TEMPLATE_APPLIED', {
+      template: tpl.key, created: plan.createCount, reused: plan.reuseCount, kept: plan.keepCount
+    });
+
+    const { rows: after } = await loadTemplateInputs(ctx, spaceId);
+    ok(res, { applied: true, plan, statuses: after });
+  }));
+
   // ── Timer (static paths BEFORE /:id so they are not captured as a task id) ──────────
   router.get('/timer/active', guard('read', async (_req, res, ctx) => {
     if (!isTaskTimeTrackingEnabled()) return ok(res, { activeTimer: null });
@@ -643,30 +742,87 @@ export function createTaskRouter(): express.Router {
     const { page, pageSize, offset } = v.parsePagination(req.query);
     const { column, ascending } = v.parseSort(req.query);
 
-    let q = supabaseAdmin.from('task_items')
-      .select(TASK_COLUMNS, { count: 'exact' })
-      .eq('workspace_id', ctx.workspaceId);
-
     const listId = v.optionalUuid(req.query?.listId, 'listId');
     const statusId = v.optionalUuid(req.query?.statusId, 'statusId');
     const parentId = v.optionalUuid(req.query?.parentTaskId, 'parentTaskId');
     const priority = v.optionalEnum(req.query?.priority, 'priority', v.PRIORITIES);
     const search = v.optionalString(req.query?.q, 'q', 200);
+    const assigneeActorId = v.optionalUuid(req.query?.assigneeActorId, 'assigneeActorId');
+    const dueBefore = req.query?.dueBefore
+      ? v.optionalTimestamp(req.query.dueBefore, 'dueBefore')
+      : null;
 
-    if (listId) q = q.eq('list_id', listId);
-    if (statusId) q = q.eq('status_id', statusId);
-    if (priority) q = q.eq('priority', priority);
-    if (parentId) q = q.eq('parent_task_id', parentId);
-    if (req.query?.rootOnly === 'true') q = q.is('parent_task_id', null);
-    if (req.query?.includeArchived !== 'true') q = q.is('archived_at', null);
-    if (search) q = q.ilike('title', `%${search.replace(/[%_]/g, '\\$&')}%`);
-    if (req.query?.dueBefore) {
-      q = q.lte('due_date', v.optionalTimestamp(req.query.dueBefore, 'dueBefore')!);
+    /**
+     * Assignee is stored in a join table, so it cannot be a column predicate. Resolving it to
+     * an id set FIRST and filtering on it keeps the filter server-side, which is what makes
+     * `count` (and therefore pagination and the group counts below) actually correct. It was
+     * previously applied in the browser to the current page only, so page 2 of an
+     * assignee-filtered list silently dropped rows and every total was the unfiltered total.
+     */
+    let assignedTaskIds: string[] | null = null;
+    if (assigneeActorId) {
+      const { data: rows, error: aErr } = await supabaseAdmin.from('task_assignments')
+        .select('task_id')
+        .eq('workspace_id', ctx.workspaceId).eq('actor_id', assigneeActorId);
+      if (aErr) throw mapDbError(aErr, 'assignee filter');
+      assignedTaskIds = [...new Set((rows ?? []).map((r: any) => r.task_id))];
     }
 
-    const { data, error, count } = await q
-      .order(column, { ascending }).range(offset, offset + pageSize - 1);
+    /** The single definition of "the active query", shared by the page and every group count. */
+    const applyFilters = (builder: any) => {
+      let b = builder.eq('workspace_id', ctx.workspaceId);
+      if (listId) b = b.eq('list_id', listId);
+      if (statusId) b = b.eq('status_id', statusId);
+      if (priority) b = b.eq('priority', priority);
+      if (parentId) b = b.eq('parent_task_id', parentId);
+      if (req.query?.rootOnly === 'true') b = b.is('parent_task_id', null);
+      if (req.query?.includeArchived !== 'true') b = b.is('archived_at', null);
+      if (search) b = b.ilike('title', `%${search.replace(/[%_]/g, '\\$&')}%`);
+      if (dueBefore) b = b.lte('due_date', dueBefore);
+      if (assignedTaskIds) b = b.in('id', assignedTaskIds);
+      return b;
+    };
+
+    // An assignee with nothing assigned matches no task at all; `.in('id', [])` is valid but
+    // short-circuiting here also skips the group-count fan-out for a guaranteed-empty result.
+    const impossible = assignedTaskIds !== null && assignedTaskIds.length === 0;
+
+    const q = applyFilters(
+      supabaseAdmin.from('task_items').select(TASK_COLUMNS, { count: 'exact' })
+    );
+
+    const { data, error, count } = impossible
+      ? { data: [] as any[], error: null, count: 0 }
+      : await q.order(column, { ascending }).range(offset, offset + pageSize - 1);
     if (error) throw mapDbError(error, 'list tasks');
+
+    /**
+     * Per-status totals for the status-grouped List view.
+     *
+     * Computed over the WHOLE active query rather than the current page, so a group's count is
+     * the number of tasks that actually match the filters — not however many of them happen to
+     * have landed on the page being viewed. One exact head-count per status, fanned out in
+     * parallel; the set is the Space's own statuses, which is a small manager-curated list, so
+     * this stays a handful of index-only counts rather than growing with the task table.
+     */
+    let groups: { statusId: string; total: number }[] | undefined;
+    if (req.query?.groupBy === 'status') {
+      const groupSpaceId = v.requireUuid(req.query?.spaceId, 'spaceId');
+      const { data: sts, error: sErr } = await supabaseAdmin.from('task_statuses')
+        .select('id').eq('workspace_id', ctx.workspaceId).eq('space_id', groupSpaceId)
+        .is('archived_at', null).order('position');
+      if (sErr) throw mapDbError(sErr, 'group statuses');
+      const statusIds = (sts ?? []).map((r: any) => r.id);
+      groups = impossible
+        ? statusIds.map((id: string) => ({ statusId: id, total: 0 }))
+        : await Promise.all(statusIds.map(async (id: string) => {
+            const { count: c, error: cErr } = await applyFilters(
+              supabaseAdmin.from('task_items').select('id', { count: 'exact', head: true })
+            ).eq('status_id', id);
+            if (cErr) throw mapDbError(cErr, 'group count');
+            return { statusId: id, total: c ?? 0 };
+          }));
+    }
 
     // Assignees fetched in ONE additional query for the whole page, never per task.
     const ids = (data ?? []).map((t: any) => t.id);
@@ -704,7 +860,7 @@ export function createTaskRouter(): express.Router {
         assigneeActorIds: byTask.get(t.id) ?? [],
         subtaskCount: subtaskCounts.get(t.id) ?? 0
       })),
-      { page: { page, pageSize, total: count ?? 0 } }
+      { page: { page, pageSize, total: count ?? 0 }, ...(groups ? { groups } : {}) }
     );
   }));
 

@@ -28,8 +28,9 @@ test.describe('Responsive layout', () => {
     // The Spaces sidebar is inline, so the mobile opener is not offered.
     await expect(page.getByRole('navigation', { name: 'Spaces and Lists' }).first()).toBeVisible();
     await expect(page.getByRole('button', { name: 'Open Spaces and Lists' })).toBeHidden();
-    // Desktop table is the visible presentation.
-    await expect(page.locator('table')).toBeVisible();
+    // Desktop table is the visible presentation. `.first()` because the status-grouped List
+    // renders one table per group.
+    await expect(page.locator('table').first()).toBeVisible();
 
     await assertNoHorizontalOverflow(page);
     await page.screenshot({ path: path.join(SHOTS, 'tasks-list-1440.png'), fullPage: true });
@@ -52,9 +53,13 @@ test.describe('Responsive layout', () => {
     await bootApp(page);
     await openTaskManagement(page);
 
-    // The wide table is hidden; the card list takes over.
-    await expect(page.locator('table')).toBeHidden();
-    const card = page.getByRole('button', { name: 'Prepare pool inspection report' })
+    // The wide table is hidden; the card list takes over. `.first()` because the
+    // status-grouped List renders one table per group.
+    await expect(page.locator('table').first()).toBeHidden();
+    // `exact`: the card's own controls name their target ("Archive “…”", "Move “…”"), so a
+    // substring match on the title resolves to every control on the card, not just its
+    // heading button.
+    const card = page.getByRole('button', { name: 'Prepare pool inspection report', exact: true })
       .filter({ visible: true });
     await expect(card).toHaveCount(1);
     await expect(card).toBeVisible();

@@ -310,7 +310,15 @@ test.describe('Accessibility', () => {
     await bootApp(page);
     await openTaskManagement(page);
 
-    await expect(page.locator('table caption')).toHaveCount(1);
+    // The status-grouped List renders one table per group, so this asserts the invariant
+    // rather than a fixed number: EVERY table has exactly one caption, whichever layout is
+    // on screen.
+    // Auto-retrying first, so the counts below are taken after the List has rendered rather
+    // than while it is still showing loading skeletons.
+    await expect(page.locator('table').first()).toBeAttached();
+    const tables = await page.locator('table').count();
+    expect(await page.locator('table > caption').count(),
+      'every table must carry its own caption').toBe(tables);
     const unscoped = await page.locator('table thead th:not([scope])').count();
     expect(unscoped, 'every header cell must declare a scope').toBe(0);
   });

@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect, useId } from 'react';
-import { X, Plus, Check, Loader2, AlertTriangle, ArrowUp, ArrowDown, Palette } from 'lucide-react';
-import { TaskApi, TaskStatus, StatusCategory } from '../../tasks/apiClient';
+import {
+  X, Plus, Check, Loader2, AlertTriangle, ArrowUp, ArrowDown, Palette, LayoutTemplate
+} from 'lucide-react';
+import { TaskApi, TaskStatus, StatusCategory, StatusTemplatePlan } from '../../tasks/apiClient';
 import DialogPortal from './DialogPortal';
 
 interface Props {
@@ -51,6 +53,18 @@ export default function StatusManagerPanel(p: Props) {
   const [newCategory, setNewCategory] = useState<StatusCategory>('todo');
   const [newColor, setNewColor] = useState<string>(SWATCHES[0]);
   const [createBusy, setCreateBusy] = useState(false);
+
+  /**
+   * Operations Status Template.
+   *
+   * `plan` holds the DRY-RUN result and nothing else. There is deliberately no path from the
+   * "Preview" button to a write: applying is a second, separate action the operator can only
+   * reach after the plan is on screen, and it is disabled while no plan is showing. That is
+   * the whole point — the template is never applied implicitly, and never without the operator
+   * having been shown exactly what it would do first.
+   */
+  const [plan, setPlan] = useState<StatusTemplatePlan | null>(null);
+  const [templateBusy, setTemplateBusy] = useState(false);
 
   // Inline edit
   const [editId, setEditId] = useState<string | null>(null);
@@ -160,6 +174,39 @@ export default function StatusManagerPanel(p: Props) {
       setError(err?.message ?? 'Could not reorder the status.');
     } finally {
       setBusyId(null);
+    }
+  };
+
+  /** Dry-run only. This calls the preview route, which performs no writes. */
+  const previewTemplate = async () => {
+    setTemplateBusy(true); setError(null);
+    try {
+      const result = await p.api.previewStatusTemplate(p.spaceId);
+      setPlan(result);
+      say(result.noop
+        ? 'This Space already matches the Operations Status Template.'
+        : `Dry run ready: ${result.createCount} status(es) would be created, ${result.reuseCount} reused, ${result.keepCount} left untouched. Nothing has changed yet.`);
+    } catch (err: any) {
+      setError(err?.message ?? 'Could not preview the template.');
+    } finally {
+      setTemplateBusy(false);
+    }
+  };
+
+  const applyTemplate = async () => {
+    // Unreachable from the UI without a plan on screen; asserted anyway so a future refactor
+    // cannot quietly turn this into a one-click mutation.
+    if (!plan) return;
+    setTemplateBusy(true); setError(null);
+    try {
+      const result = await p.api.applyStatusTemplate(p.spaceId);
+      setPlan(null);
+      say(`Operations Status Template applied: ${result.plan.createCount} created, ${result.plan.reuseCount} reused, ${result.plan.keepCount} left untouched.`);
+      p.onChanged();
+    } catch (err: any) {
+      setError(err?.message ?? 'Could not apply the template.');
+    } finally {
+      setTemplateBusy(false);
     }
   };
 
@@ -370,6 +417,79 @@ export default function StatusManagerPanel(p: Props) {
               <Plus className="w-3.5 h-3.5" aria-hidden="true" /> Add a status
             </button>
           )}
+
+          {/* ── Operations Status Template ─────────────────────────────────────────── */}
+          <section aria-labelledby={`${headingId}-tpl`} className="border-t border-slate-100 pt-4 space-y-2">
+            <h3 id={`${headingId}-tpl`} className="text-[11px] font-black uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
+              <LayoutTemplate className="w-3.5 h-3.5 text-slate-600" aria-hidden="true" />
+              Operations Status Template
+            </h3>
+            <p className="text-[10px] text-slate-600 leading-relaxed">
+              Adds the seven-stage operational workflow — TO DO, IN PROGRESS, WAITING, REVIEW,
+              DONE, BLOCKED, TO SCHEDULE — to <strong>{p.spaceName}</strong>. Statuses that
+              already exist are reused, keeping their id, so no task changes status. Nothing is
+              ever deleted or archived.
+            </p>
+
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={previewTemplate}
+                disabled={templateBusy}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-bold bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 cursor-pointer disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-300 focus-visible:outline-none transition-colors"
+              >
+                {templateBusy && !plan
+                  ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                  : <LayoutTemplate className="w-3.5 h-3.5" aria-hidden="true" />}
+                Preview template changes
+              </button>
+              {plan && !plan.noop && (
+                <button
+                  onClick={applyTemplate}
+                  disabled={templateBusy}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-bold bg-blue-600 hover:bg-blue-700 text-white cursor-pointer disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-400 focus-visible:outline-none transition-colors"
+                >
+                  {templateBusy
+                    ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                    : <Check className="w-3.5 h-3.5" aria-hidden="true" />}
+                  Apply template
+                </button>
+              )}
+            </div>
+
+            {plan && (
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2">
+                <p className="text-[10px] font-black uppercase tracking-wider text-slate-700">
+                  Dry run — nothing has been changed
+                </p>
+                <p className="text-[11px] font-semibold text-slate-700">
+                  {plan.noop
+                    ? 'This Space already matches the template exactly. Applying it would change nothing.'
+                    : `${plan.createCount} to create · ${plan.reuseCount} reused · ${plan.keepCount} left untouched`}
+                </p>
+                <ol className="space-y-1" aria-label="Planned template changes">
+                  {plan.items.map((item, i) => (
+                    <li key={`${item.statusId ?? item.name}-${i}`} className="flex items-start gap-2 text-[11px]">
+                      <span
+                        className={`shrink-0 mt-0.5 text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded border ${
+                          item.action === 'create'
+                            ? 'bg-blue-50 text-blue-700 border-blue-200'
+                            : item.action === 'reuse'
+                              ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                              : 'bg-slate-100 text-slate-700 border-slate-300'
+                        }`}
+                      >
+                        {item.action}
+                      </span>
+                      <span className="min-w-0">
+                        <span className="font-bold text-slate-800">{item.name}</span>
+                        <span className="text-slate-600"> — {item.note}</span>
+                      </span>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )}
+          </section>
 
           <p className="text-[10px] text-slate-500 leading-relaxed border-t border-slate-100 pt-3">
             Statuses cannot be removed here. A status may still be referenced by existing

@@ -188,7 +188,7 @@ export default function TaskListView(p: Props) {
                         {mutable && (
                           <button
                             onClick={() => p.onArchiveToggle(t)}
-                            aria-label={t.archived_at ? 'Restore task' : 'Archive task'}
+                            aria-label={t.archived_at ? `Restore “${t.title}”` : `Archive “${t.title}”`}
                             title={t.archived_at ? 'Restore' : 'Archive'}
                             className="p-1 rounded-lg text-slate-500 hover:text-slate-700 hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-blue-300 focus-visible:outline-none transition-colors cursor-pointer"
                           >
@@ -254,7 +254,7 @@ export default function TaskListView(p: Props) {
                     )}
                     <button
                       onClick={() => p.onArchiveToggle(t)}
-                      aria-label={t.archived_at ? 'Restore task' : 'Archive task'}
+                      aria-label={t.archived_at ? `Restore “${t.title}”` : `Archive “${t.title}”`}
                       className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-blue-300 focus-visible:outline-none transition-colors cursor-pointer"
                     >
                       {t.archived_at

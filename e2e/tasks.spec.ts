@@ -11,9 +11,14 @@ test.describe('Task list, filtering and sorting', () => {
 
     await expect(taskItems(page)).toHaveCount(3);
     const first = taskItem(page, 'Prepare pool inspection report');
-    await expect(first).toContainText('To Do');
     await expect(first).toContainText('high');
     await expect(first).toContainText('Sep 1');
+    // Status is now carried by the group the row sits in, not by a per-row cell — the
+    // grouped List is the default layout.
+    // `exact`: the row's own controls name their target too ("Archive “…”"), so a substring
+    // match on the title resolves to several buttons.
+    await expect(page.getByRole('region', { name: 'To Do, 1 task' })
+      .getByRole('button', { name: 'Prepare pool inspection report', exact: true })).toBeVisible();
   });
 
   test('the desktop table carries the columns the mobile card omits', async ({ page }, info) => {
@@ -75,6 +80,12 @@ test.describe('Task list, filtering and sorting', () => {
     const api = await installApi(page, { role: 'ADMIN' });
     await bootApp(page);
     await openTaskManagement(page);
+
+    // A single global ordering is only observable in the Flat layout: the grouped List
+    // orders WITHIN each status group, so "first row on screen" is the first task of the
+    // first group, not the first task overall.
+    await page.getByRole('group', { name: 'Choose a List layout' })
+      .getByRole('button', { name: 'Flat' }).click();
 
     await page.locator('#f-sort').selectOption('title');
     await expect(taskItems(page).nth(0)).toContainText('My own task');
@@ -247,14 +258,14 @@ test.describe('Task creation, editing and archiving', () => {
 
     const row = taskItem(page, 'Schedule filter replacement');
     page.once('dialog', d => { expect(d.message()).toContain('Archive'); d.accept(); });
-    await row.getByRole('button', { name: 'Archive task' }).click();
+    await row.getByRole('button', { name: /^Archive “/ }).click();
 
     await expect(taskItems(page)).toHaveCount(2);
 
     await page.getByLabel('Show archived').check();
     const archived = taskItem(page, 'Schedule filter replacement');
     await expect(archived).toContainText('Archived');
-    await archived.getByRole('button', { name: 'Restore task' }).click();
+    await archived.getByRole('button', { name: /^Restore “/ }).click();
     await expect(archived).not.toContainText('Archived');
   });
 
@@ -265,7 +276,7 @@ test.describe('Task creation, editing and archiving', () => {
 
     page.once('dialog', d => d.dismiss());
     await taskItem(page, 'Schedule filter replacement')
-      .getByRole('button', { name: 'Archive task' }).click();
+      .getByRole('button', { name: /^Archive “/ }).click();
 
     await expect(taskItems(page)).toHaveCount(3);
     expect(api.requests().some(r => r.includes('/archive'))).toBe(false);

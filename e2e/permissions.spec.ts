@@ -10,7 +10,7 @@ test.describe('Role and entitlement affordances', () => {
     await expect(taskItems(page)).toHaveCount(3);
     await expect(page.locator('#btn-new-task')).toHaveCount(0);
     await expect(page.locator('#btn-manage-statuses')).toHaveCount(0);
-    await expect(page.getByRole('button', { name: 'Archive task' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Archive “/ })).toHaveCount(0);
 
     // The drawer opens read-only: no Edit, no Archive, no subtask control.
     await page.getByRole('button', { name: 'Prepare pool inspection report' }).first().click();
@@ -39,8 +39,8 @@ test.describe('Role and entitlement affordances', () => {
     const mine = taskItem(page, 'My own task');
     const theirs = taskItem(page, 'Prepare pool inspection report');
 
-    await expect(mine.getByRole('button', { name: 'Archive task' })).toBeVisible();
-    await expect(theirs.getByRole('button', { name: 'Archive task' })).toHaveCount(0);
+    await expect(mine.getByRole('button', { name: 'Archive “My own task”' })).toBeVisible();
+    await expect(theirs.getByRole('button', { name: /^Archive “/ })).toHaveCount(0);
   });
 
   test('an expired workspace is told it is read-only and loses its create control', async ({ page }) => {
@@ -87,7 +87,7 @@ test.describe('Role and entitlement affordances', () => {
 
     page.once('dialog', d => d.accept());
     await taskItem(page, 'Schedule filter replacement')
-      .getByRole('button', { name: 'Archive task' }).click();
+      .getByRole('button', { name: /^Archive “/ }).click();
 
     await expect(page.getByRole('alert').filter({ hasText: 'do not have permission' })).toBeVisible();
   });
@@ -102,7 +102,7 @@ test.describe('Role and entitlement affordances', () => {
 
     page.once('dialog', d => d.accept());
     await taskItem(page, 'Schedule filter replacement')
-      .getByRole('button', { name: 'Archive task' }).click();
+      .getByRole('button', { name: /^Archive “/ }).click();
 
     const banner = page.getByRole('alert').filter({ hasText: 'do not have permission' });
     await expect(banner).toBeVisible();
