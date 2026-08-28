@@ -179,6 +179,27 @@ export default function TaskManagementView({ token, role }: Props) {
 
   useEffect(() => { loadTasks(); }, [loadTasks]);
 
+  /**
+   * Starting or stopping a timer writes/closes a task_time_entries row, which the List's
+   * `tracked` summary must reflect — but TimerToggleButton (in rows, board cards and the
+   * drawer) and the global ActiveTimerBar call timer.start/stop directly and have no idea
+   * this view even has a cache to invalidate. This effect is the missing link.
+   *
+   * Keyed on the running entry's id, not the activeTimer object reference: refresh() also
+   * runs on window focus and the 'online' event and always calls setActiveTimer with a new
+   * object even when the running timer hasn't changed, which would re-trigger a naive
+   * reference-based effect on every tab switch. The id only changes on an actual start, stop
+   * or switch. The first-render guard skips the initial mount (loadTasks already fetches a
+   * correct, current summary on mount regardless of whether a timer happens to be running),
+   * so this fires only on a genuine transition thereafter.
+   */
+  const activeTimerEntryId = timer.activeTimer?.id ?? null;
+  const isFirstTimerSync = useRef(true);
+  useEffect(() => {
+    if (isFirstTimerSync.current) { isFirstTimerSync.current = false; return; }
+    loadTasks();
+  }, [activeTimerEntryId]);
+
   const refreshAll = useCallback(() => { loadTasks(); timer.refresh(); }, [loadTasks, timer]);
 
   const spaceStatuses = useMemo(

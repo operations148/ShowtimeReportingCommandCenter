@@ -9,7 +9,9 @@
  * affordance so the UI does not offer actions the server will reject.)
  */
 
-import { TaskApiError, formatDuration, formatTracked, newClientToken } from '../src/tasks/apiClient.js';
+import {
+  TaskApiError, formatDuration, formatTracked, formatTrackedDuration, newClientToken
+} from '../src/tasks/apiClient.js';
 import { UserRole } from '../src/types.js';
 
 let passed = 0;
@@ -29,13 +31,77 @@ check('long shift', formatDuration(36000), '10:00:00');
 check('negative clamps to zero (clock skew must not show a negative timer)', formatDuration(-10), '0:00:00');
 check('fractional truncates', formatDuration(59.9), '0:00:59');
 
-console.log('\n--- formatTracked (summaries) ---');
+console.log('\n--- formatTracked (ESTIMATE-only; must stay exactly as-is) ---');
 check('under a minute', formatTracked(30), '30s');
 check('exact minute', formatTracked(60), '1m');
 check('minutes', formatTracked(605), '10m');
 check('hours and minutes', formatTracked(3900), '1h 5m');
 check('whole hours', formatTracked(7200), '2h 0m');
 check('negative clamps', formatTracked(-5), '0s');
+
+console.log('\n--- formatTrackedDuration (canonical ACTUAL-tracked-time formatter) ---');
+// The exact table from the tracked-hours fix spec.
+check('zero -> em dash, not 0m or empty', formatTrackedDuration(0), '—');
+check('5 seconds', formatTrackedDuration(5), '5s');
+check('48 seconds (the original bug report)', formatTrackedDuration(48), '48s');
+check('59 seconds', formatTrackedDuration(59), '59s');
+check('60 seconds -> 1m, not 1m 0s', formatTrackedDuration(60), '1m');
+check('61 seconds -> 1m 1s', formatTrackedDuration(61), '1m 1s');
+check('1 hour -> bare 1h, not 1h 0m', formatTrackedDuration(3600), '1h');
+check('1 hour 2 minutes', formatTrackedDuration(3720), '1h 2m');
+// Edge cases beyond the spec's own table.
+check('1 second, singular, still visible', formatTrackedDuration(1), '1s');
+check('a positive sub-minute value is never treated as empty (contrast with 0)',
+  formatTrackedDuration(1) === '—', false);
+check('minute boundary just below (119s)', formatTrackedDuration(119), '1m 59s');
+check('two whole hours, no dangling 0m', formatTrackedDuration(7200), '2h');
+check('multi-hour with minutes', formatTrackedDuration(9005), '2h 30m');
+check('negative clamps to em dash (never a negative or NaN string)', formatTrackedDuration(-5), '—');
+check('fractional truncates like every other duration helper here',
+  formatTrackedDuration(48.9), '48s');
+check('sub-second positive still rounds down to a whole second, not to zero',
+  formatTrackedDuration(0.5), '—'); // floors to 0 seconds -> genuinely no tracked time yet
+
+console.log('\n--- Aggregation contract mirrored from /time/summary and the drawer reducer ---');
+/**
+ * Neither the server's byTask reducer (router.ts) nor the drawer's client-side reduce() is
+ * exported as a standalone function, so this mirrors their shared formula — sum
+ * floor((end-start)/1000) per entry, using `now` in place of a null ended_at — to pin the
+ * ARITHMETIC CONTRACT the fix depends on: multiple entries sum correctly regardless of
+ * source, and a still-running entry contributes its elapsed-so-far rather than nothing.
+ */
+function sumTrackedSeconds(
+  entries: { started_at: string; ended_at: string | null }[], now: number
+): number {
+  return entries.reduce((sum, e) => {
+    const end = e.ended_at ? Date.parse(e.ended_at) : now;
+    return sum + Math.max(0, Math.floor((end - Date.parse(e.started_at)) / 1000));
+  }, 0);
+}
+const NOW = Date.parse('2026-08-20T12:00:00.000Z');
+check('multiple completed entries totaling 48 seconds (5s + 43s, the original report)',
+  sumTrackedSeconds([
+    { started_at: '2026-08-20T09:00:00.000Z', ended_at: '2026-08-20T09:00:05.000Z' },
+    { started_at: '2026-08-20T09:05:00.000Z', ended_at: '2026-08-20T09:05:43.000Z' }
+  ], NOW), 48);
+check('manual and timer entries are summed identically regardless of source',
+  sumTrackedSeconds([
+    { started_at: '2026-08-20T09:00:00.000Z', ended_at: '2026-08-20T09:00:20.000Z' }, // manual
+    { started_at: '2026-08-20T09:10:00.000Z', ended_at: '2026-08-20T09:10:28.000Z' }  // timer
+  ], NOW), 48);
+check('a running entry (ended_at null) contributes its elapsed-so-far, not zero',
+  sumTrackedSeconds([{ started_at: new Date(NOW - 90_000).toISOString(), ended_at: null }], NOW), 90);
+// Both /time/summary and GET /:id/time-entries filter `archived_at is null` in the query
+// itself (router.ts), so an archived row never reaches this reducer at all. This pins that
+// same is-null-only contract at the call site, using the same shape the server rows have.
+const withOneArchived = [
+  { started_at: '2026-08-20T09:00:00.000Z', ended_at: '2026-08-20T09:00:05.000Z', archived_at: null as string | null },
+  { started_at: '2026-08-20T09:05:00.000Z', ended_at: '2026-08-20T09:05:43.000Z', archived_at: '2026-08-20T10:00:00.000Z' }
+];
+check('deleted/archived-entry subtraction: an archived entry drops out of the total',
+  sumTrackedSeconds(withOneArchived.filter(e => !e.archived_at), NOW), 5); // the 43s entry archived -> only 5s remains
+check('restoring (un-archiving) an entry adds it back to the total',
+  sumTrackedSeconds(withOneArchived.map(e => ({ ...e, archived_at: null })), NOW), 48);
 
 console.log('\n--- newClientToken (timer idempotency) ---');
 const t1 = newClientToken(), t2 = newClientToken();

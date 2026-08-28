@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Loader2, AlertTriangle, MoveRight, Inbox } from 'lucide-react';
-import { TaskItem, TaskStatus, WorkspaceActor, formatTracked } from '../../tasks/apiClient';
+import { TaskItem, TaskStatus, WorkspaceActor, formatTrackedDuration } from '../../tasks/apiClient';
 import { TimerToggleButton } from './ActiveTimerBar';
 import type { ActiveTimerState } from '../../hooks/useActiveTaskTimer';
 
@@ -158,7 +158,7 @@ export default function TaskBoardView(p: Props) {
                           ) : null}
                           {tracked > 0 && (
                             <span className="text-[9px] font-mono font-bold text-slate-500">
-                              {formatTracked(tracked)}
+                              {formatTrackedDuration(tracked)}
                             </span>
                           )}
                         </div>

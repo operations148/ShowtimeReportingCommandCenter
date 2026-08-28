@@ -26,6 +26,12 @@ type ApiState = {
   lists: any[];
   spaces: any[];
   activeTimer: { id: string; task_id: string; started_at: string } | null;
+  /** Backs GET /time/summary and GET /:id/time-entries so both derive from the SAME data —
+   *  starting/stopping a timer, adding a manual entry, or archiving one all mutate this array,
+   *  and every reader recomputes from it. A prior version of this harness returned a static
+   *  canned summary regardless of what the timer/manual-entry routes did, which could never
+   *  have caught the List-row staleness bug this fixture now exists to test. */
+  timeEntries: any[];
   overrides: Map<string, { status: number; body: string; sticky?: boolean }>;
   hold: Set<string>;
   seen: string[];
@@ -81,6 +87,7 @@ export async function installApi(
     caps?: Record<string, unknown>;
     tasks?: any[];
     spaces?: any[];
+    timeEntries?: any[];
   } = {}
 ): Promise<Harness> {
   const role = opts.role ?? 'ADMIN';
@@ -93,6 +100,11 @@ export async function installApi(
     lists: JSON.parse(JSON.stringify(F.lists)),
     spaces: JSON.parse(JSON.stringify(opts.spaces ?? F.spaces)),
     activeTimer: null,
+    timeEntries: JSON.parse(JSON.stringify(opts.timeEntries ?? [{
+      id: 'entry-1', task_id: F.TASK_1, actor_id: F.ACTOR_ME,
+      started_at: '2026-08-02T09:00:00.000Z', ended_at: '2026-08-02T10:30:00.000Z',
+      source: 'manual', note: 'Site visit', archived_at: null
+    }])),
     overrides: new Map(),
     hold: new Set(),
     seen: []
@@ -201,11 +213,28 @@ function handleTasks(
   if (method === 'GET' && seg[0] === 'actors') return [200, ok(F.actors)];
 
   // ---- Time summary (must precede the /:id route) -----------------------
+  // Mirrors the server's own /time/summary: sums every non-archived entry, using `now` as the
+  // end of a still-running one — so a live timer's elapsed-so-far counts here exactly as it
+  // does in production, and the numbers this returns are ALWAYS derived from the same
+  // s.timeEntries/s.activeTimer that the timer and manual-entry routes below actually mutate.
   if (method === 'GET' && seg[0] === 'time' && seg[1] === 'summary') {
+    const live = s.activeTimer
+      ? [{ task_id: s.activeTimer.task_id, actor_id: F.ACTOR_ME,
+           started_at: s.activeTimer.started_at, ended_at: null }]
+      : [];
+    const rows = [...s.timeEntries.filter((e) => !e.archived_at), ...live];
+    const byTask = new Map<string, number>();
+    const byMember = new Map<string, number>();
+    for (const e of rows) {
+      const end = e.ended_at ? Date.parse(e.ended_at) : Date.now();
+      const secs = Math.max(0, Math.floor((end - Date.parse(e.started_at)) / 1000));
+      byTask.set(e.task_id, (byTask.get(e.task_id) ?? 0) + secs);
+      byMember.set(e.actor_id, (byMember.get(e.actor_id) ?? 0) + secs);
+    }
     return [200, ok({
-      byTask: [{ taskId: F.TASK_1, trackedSeconds: 5400 }],
+      byTask: [...byTask].map(([taskId, trackedSeconds]) => ({ taskId, trackedSeconds })),
       byMember: s.caps.timeVisibility === 'team'
-        ? [{ actorId: F.ACTOR_ME, trackedSeconds: 5400 }] : [],
+        ? [...byMember].map(([actorId, trackedSeconds]) => ({ actorId, trackedSeconds })) : [],
       visibility: s.caps.timeVisibility
     })];
   }
@@ -238,9 +267,21 @@ function handleTasks(
       if (!s.activeTimer) return [404, fail('TASK_NO_ACTIVE_TIMER', 'No running timer to stop.')];
       const stopped = s.activeTimer;
       s.activeTimer = null;
+      const endedAt = now();
+      // Real elapsed from started_at (which a test may have backdated), not a fixed constant —
+      // so a test can assert an exact, deterministic tracked duration after stopping without
+      // waiting in wall-clock time, and the entry recorded here is the SAME one /time/summary
+      // and GET /:id/time-entries subsequently read.
+      const durationSeconds =
+        Math.max(0, Math.floor((Date.parse(endedAt) - Date.parse(stopped.started_at)) / 1000));
+      s.timeEntries.push({
+        id: stopped.id, task_id: stopped.task_id, actor_id: F.ACTOR_ME,
+        started_at: stopped.started_at, ended_at: endedAt, source: 'timer',
+        note: null, archived_at: null
+      });
       return [200, ok({
         entryId: stopped.id, taskId: stopped.task_id, startedAt: stopped.started_at,
-        endedAt: now(), durationSeconds: 63, outcome: 'stopped'
+        endedAt, durationSeconds, outcome: 'stopped'
       })];
     }
   }
@@ -253,11 +294,25 @@ function handleTasks(
     if (new Date(body.endedAt) <= new Date(body.startedAt)) {
       return [400, fail('TASK_VALIDATION_FAILED', 'The end time must be after the start time.')];
     }
-    return [201, ok({
-      id: 'entry-manual', task_id: body.taskId, actor_id: F.ACTOR_ME,
+    const created = {
+      id: `entry-manual-${s.timeEntries.length + 1}`, task_id: body.taskId, actor_id: F.ACTOR_ME,
       started_at: body.startedAt, ended_at: body.endedAt,
-      source: 'manual', note: body.note ?? null
-    })];
+      source: 'manual', note: body.note ?? null, archived_at: null
+    };
+    s.timeEntries.push(created);
+    return [201, ok(created)];
+  }
+
+  // ---- Time entry edit / archive (restore) -------------------------------
+  if (seg[0] === 'time-entries' && seg[1] && method === 'PATCH') {
+    const entry = s.timeEntries.find((e) => e.id === seg[1]);
+    if (!entry) return [404, fail('TASK_NOT_FOUND', 'Time entry not found.')];
+    if (body.note !== undefined) entry.note = body.note;
+    if (body.startedAt !== undefined) entry.started_at = body.startedAt;
+    if (body.endedAt !== undefined) entry.ended_at = body.endedAt;
+    if (body.archived === true) entry.archived_at = now();
+    if (body.archived === false) entry.archived_at = null;
+    return [200, ok(entry)];
   }
 
   // ---- Statuses ---------------------------------------------------------
@@ -421,14 +476,13 @@ function handleTasks(
     if (s.caps.timeVisibility === 'aggregate_only') {
       return [200, ok({ entries: [], visibility: 'aggregate_only' })];
     }
-    return [200, ok({
-      entries: [{
-        id: 'entry-1', task_id: id, actor_id: F.ACTOR_ME,
-        started_at: '2026-08-02T09:00:00.000Z', ended_at: '2026-08-02T10:30:00.000Z',
-        source: 'manual', note: 'Site visit', archived_at: null
-      }],
-      visibility: s.caps.timeVisibility
-    })];
+    const completed = s.timeEntries.filter((e) => e.task_id === id && !e.archived_at);
+    const live = s.activeTimer && s.activeTimer.task_id === id
+      ? [{ id: s.activeTimer.id, task_id: id, actor_id: F.ACTOR_ME,
+           started_at: s.activeTimer.started_at, ended_at: null,
+           source: 'timer', note: null, archived_at: null }]
+      : [];
+    return [200, ok({ entries: [...completed, ...live], visibility: s.caps.timeVisibility })];
   }
   if (seg[1] === 'assignees' && method === 'PUT') {
     if (!t) return [404, fail('TASK_NOT_FOUND', 'Task not found.')];
