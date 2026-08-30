@@ -130,3 +130,78 @@ export function assertCanViewMemberBreakdown(role: UserRole): void {
     throw forbidden('Only workspace administrators can view team time totals.');
   }
 }
+
+// ── Channels ───────────────────────────────────────────────────────────────────────────
+
+/** Creating, renaming, reordering, archiving and setting membership on a Channel. */
+export function assertCanManageChannels(role: UserRole): void {
+  if (!isManager(role)) {
+    throw forbidden('Only workspace administrators can manage channels.');
+  }
+}
+
+/** Managers and contributors may post. READ_ONLY may read a channel but never write to it. */
+export function assertCanPostMessage(role: UserRole): void {
+  if (!isManager(role) && !isContributor(role)) {
+    throw forbidden('Your role cannot post messages.');
+  }
+}
+
+/**
+ * Editing a message is an AUTHOR-ONLY right, deliberately not extended to managers.
+ *
+ * A manager moderating a channel can remove a message (see assertCanDeleteMessage) but can
+ * never rewrite one: altering someone's words while they still appear under that person's
+ * name is a strictly worse power than removing the message outright, and nothing in this
+ * product needs it. The time-bound is applied by the caller, which owns the clock.
+ */
+export function assertCanEditMessage(
+  role: UserRole,
+  actorId: string,
+  message: { author_actor_id: string }
+): void {
+  if (message.author_actor_id !== actorId) {
+    throw forbidden('You can only edit your own messages.');
+  }
+  // An author whose role has since been reduced to read-only loses write access entirely.
+  assertCanPostMessage(role);
+}
+
+/**
+ * Soft-deleting a message: the author may remove their own, and a manager may moderate any.
+ * There is no hard delete anywhere in this subsystem.
+ */
+export function assertCanDeleteMessage(
+  role: UserRole,
+  actorId: string,
+  message: { author_actor_id: string }
+): void {
+  if (isManager(role)) return;
+  if (message.author_actor_id !== actorId) {
+    throw forbidden('You can only delete your own messages.');
+  }
+  assertCanPostMessage(role);
+}
+
+/**
+ * Read access to a channel.
+ *
+ * A 'workspace' channel is readable by every role, READ_ONLY included. A 'restricted' channel
+ * is readable only by an actor with a membership row — except for managers, who administer
+ * the workspace and would otherwise be unable to moderate a channel they had not added
+ * themselves to. `isMember` must be resolved from the database, never from the request.
+ */
+export function assertCanReadChannel(
+  role: UserRole,
+  channel: { visibility: string },
+  isMember: boolean
+): void {
+  if (channel.visibility !== 'restricted') return;
+  if (isManager(role)) return;
+  if (!isMember) {
+    // Deliberately the same message and code whether the channel is missing or merely
+    // invisible: distinguishing them would confirm the existence of a channel the caller
+    // is not allowed to know about.
+    throw forbidden('You do not have access to this channel.');
+  }
+}

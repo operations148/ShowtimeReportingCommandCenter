@@ -26,6 +26,18 @@ export type TaskErrorCode =
   | 'TASK_FOLDER_NOT_EMPTY'
   /** The Folder named in the request belongs to a different Space than the List being moved. */
   | 'TASK_FOLDER_CROSS_SPACE'
+  /** The deployment runs Task Management, but the Channels subsystem is switched off. */
+  | 'TASK_CHANNELS_DISABLED'
+  /** Too many messages from this author in the current window. Carries retryAfterMs. */
+  | 'TASK_RATE_LIMITED'
+  /** The caller is not a member of a restricted Channel. */
+  | 'TASK_CHANNEL_FORBIDDEN'
+  /** The Channel is archived: it can still be read, but not posted to. */
+  | 'TASK_CHANNEL_ARCHIVED'
+  /** The edit window for an author's own message has closed. */
+  | 'TASK_MESSAGE_EDIT_WINDOW_CLOSED'
+  /** The message has been deleted; it cannot be edited or replied to. */
+  | 'TASK_MESSAGE_DELETED'
   | 'TASK_INTERNAL_ERROR';
 
 /**
@@ -84,6 +96,33 @@ export const folderNotEmpty = (listCount: number) =>
 export const folderCrossSpace = () =>
   new TaskError(422, 'TASK_FOLDER_CROSS_SPACE',
     'That folder belongs to a different Space and cannot be used here.');
+
+export const channelsDisabled = () =>
+  new TaskError(403, 'TASK_CHANNELS_DISABLED', 'Channels are not enabled.');
+
+/**
+ * 429 with the wait built in, so a client backs off by the server's clock rather than
+ * guessing. Deliberately does NOT say how many sends remain or what the limit is: that would
+ * tell a scripted caller exactly how hard it can push without tripping it.
+ */
+export const rateLimited = (retryAfterMs: number) =>
+  new TaskError(429, 'TASK_RATE_LIMITED',
+    'You are sending messages too quickly. Wait a moment and try again.',
+    { retryAfterMs });
+
+export const channelForbidden = () =>
+  new TaskError(403, 'TASK_CHANNEL_FORBIDDEN', 'You do not have access to this channel.');
+
+export const channelArchived = () =>
+  new TaskError(409, 'TASK_CHANNEL_ARCHIVED',
+    'This channel is archived. Restore it before posting.');
+
+export const editWindowClosed = (minutes: number) =>
+  new TaskError(403, 'TASK_MESSAGE_EDIT_WINDOW_CLOSED',
+    `Messages can only be edited within ${minutes} minutes of being sent.`);
+
+export const messageDeleted = () =>
+  new TaskError(409, 'TASK_MESSAGE_DELETED', 'That message has been deleted.');
 
 /**
  * Wraps an async handler so thrown TaskErrors become contract responses and anything else

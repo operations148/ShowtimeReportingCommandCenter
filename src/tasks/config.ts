@@ -29,6 +29,15 @@ export function isTaskTimeTrackingEnabled(): boolean {
 }
 
 /**
+ * Sub-switch for the Channels messaging subsystem, independent of time tracking so messaging
+ * can be piloted (or withdrawn) without touching the task hierarchy. Fail-closed like the
+ * others: merging or deploying this code cannot expose Channels in Production by accident.
+ */
+export function isTaskChannelsEnabled(): boolean {
+  return isTaskManagementEnabled() && envFlag('TASK_CHANNELS_ENABLED');
+}
+
+/**
  * Issuer for Supabase-sourced principals — pins WHICH Supabase project vouched for a user
  * id, so ids from a different project (e.g. after a project migration) are never treated as
  * the same person. Derived from the host only; contains no secret.

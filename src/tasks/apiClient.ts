@@ -22,6 +22,8 @@ export type TaskErrorCode =
   | 'TASK_NOT_FOUND' | 'TASK_VALIDATION_FAILED' | 'TASK_VERSION_CONFLICT'
   | 'TASK_TIMER_CONFLICT' | 'TASK_NO_ACTIVE_TIMER'
   | 'TASK_FOLDER_NOT_EMPTY' | 'TASK_FOLDER_CROSS_SPACE'
+  | 'TASK_CHANNELS_DISABLED' | 'TASK_RATE_LIMITED' | 'TASK_CHANNEL_FORBIDDEN'
+  | 'TASK_CHANNEL_ARCHIVED' | 'TASK_MESSAGE_EDIT_WINDOW_CLOSED' | 'TASK_MESSAGE_DELETED'
   | 'TASK_INTERNAL_ERROR'
   | 'TASK_UNAUTHENTICATED' | 'TASK_NETWORK';
 
@@ -90,6 +92,56 @@ export interface PageInfo { page: number; pageSize: number; total: number; }
  */
 export interface StatusGroupCount { statusId: string; total: number; }
 
+// ── Channels ───────────────────────────────────────────────────────────────────────────
+
+export type ChannelVisibility = 'workspace' | 'restricted';
+export type ChannelMemberRole = 'member' | 'moderator';
+
+export interface TaskChannel {
+  id: string;
+  /** Optional Space association. Metadata only — it never affects who can see the channel. */
+  space_id: string | null;
+  name: string; slug: string; description: string | null;
+  visibility: ChannelVisibility;
+  position: number; version: number; archived_at: string | null;
+  created_at: string; updated_at: string;
+  /** Present on the list route only. */
+  unreadCount?: number;
+  lastReadAt?: string | null;
+}
+
+/**
+ * A message as the API presents it.
+ *
+ * A deleted message keeps its place in the thread but is returned as a tombstone: `body` and
+ * `authorActorId` are null for EVERYONE, the author included. Moderation that left the text
+ * retrievable would not be moderation.
+ */
+export interface ChannelMessage {
+  id: string; channelId: string;
+  authorActorId: string | null;
+  body: string | null;
+  parentMessageId: string | null;
+  editedAt: string | null;
+  deletedAt: string | null;
+  createdAt: string; updatedAt: string;
+  /** Opaque keyset cursor for this message. Never parse it. */
+  cursor: string;
+}
+
+export interface ChannelMessagePage {
+  limit: number;
+  /** Cursor to send as `after` on the next poll. */
+  nextAfter: string | null;
+  /** Cursor to send as `before` to page further back. */
+  nextBefore: string | null;
+  hasMoreBefore: boolean;
+}
+
+export interface ChannelUnread {
+  channelId: string; unreadCount: number; lastReadAt: string | null;
+}
+
 export type StatusTemplatePlanAction = 'reuse' | 'create' | 'keep';
 export interface StatusTemplatePlanItem {
   action: StatusTemplatePlanAction;
@@ -119,7 +171,13 @@ export class TaskApiError extends Error {
     return ['TASK_MODULE_DISABLED', 'TASK_ROLLOUT_EXCLUDED',
             'TASK_WORKSPACE_SUSPENDED', 'TASK_ACTOR_UNRESOLVED',
             'TASK_FORBIDDEN', 'TASK_NOT_FOUND',
-            'TASK_FOLDER_NOT_EMPTY', 'TASK_FOLDER_CROSS_SPACE'].includes(this.code);
+            'TASK_FOLDER_NOT_EMPTY', 'TASK_FOLDER_CROSS_SPACE',
+            // Channels: each of these needs the caller to change something (enable the
+            // feature, get access, restore the channel, or accept the message is gone).
+            // TASK_RATE_LIMITED is deliberately NOT here: waiting and retrying is exactly
+            // what resolves it, and it carries retryAfterMs saying how long to wait.
+            'TASK_CHANNELS_DISABLED', 'TASK_CHANNEL_FORBIDDEN', 'TASK_CHANNEL_ARCHIVED',
+            'TASK_MESSAGE_EDIT_WINDOW_CLOSED', 'TASK_MESSAGE_DELETED'].includes(this.code);
   }
 }
 
@@ -270,6 +328,70 @@ export function createTaskApi(getToken: () => string) {
     setAssignees: (id: string, actorIds: string[]) =>
       request<{ taskId: string; assigneeActorIds: string[] }>(
         'PUT', `/${id}/assignees`, { body: { actorIds } }).then(r => r.data),
+
+    // Channels
+    listChannels: (includeArchived = false, signal?: AbortSignal) =>
+      request<TaskChannel[]>('GET', '/channels', {
+        query: { includeArchived: includeArchived ? 'true' : undefined }, signal
+      }).then(r => r.data),
+
+    channelUnread: (signal?: AbortSignal) =>
+      request<ChannelUnread[]>('GET', '/channels/unread', { signal }).then(r => r.data),
+
+    createChannel: (body: {
+      name: string; description?: string;
+      visibility?: ChannelVisibility; spaceId?: string | null; position?: number;
+    }) => request<TaskChannel>('POST', '/channels', { body }).then(r => r.data),
+
+    /** Covers rename, describe, re-scope, reorder and archive/restore — all version-checked. */
+    updateChannel: (id: string, body: Record<string, unknown>) =>
+      request<TaskChannel>('PATCH', `/channels/${id}`, { body }).then(r => r.data),
+
+    setChannelMembers: (id: string, members: { actorId: string; role?: ChannelMemberRole }[]) =>
+      request<{ channelId: string; members: { actorId: string; role: ChannelMemberRole }[] }>(
+        'PUT', `/channels/${id}/members`, { body: { members } }).then(r => r.data),
+
+    /**
+     * One route for history and polling.
+     *   `after`  — everything strictly after the cursor (the poll path)
+     *   `before` — the page immediately before it (the scroll-back path)
+     * Either way messages come back oldest-first, so a caller appends or prepends a
+     * contiguous run without re-sorting.
+     */
+    listChannelMessages: (
+      channelId: string,
+      opts: { after?: string | null; before?: string | null; limit?: number } = {},
+      signal?: AbortSignal
+    ) => request<ChannelMessage[]>('GET', `/channels/${channelId}/messages`, {
+      query: { after: opts.after ?? undefined, before: opts.before ?? undefined, limit: opts.limit },
+      signal
+    }).then(r => ({ messages: r.data ?? [], page: r.raw?.page as ChannelMessagePage })),
+
+    /**
+     * Sends a message. `clientToken` MUST be stable across retries of the same user intent —
+     * the server dedupes on it, so a retried request returns the ORIGINAL message (with
+     * `outcome: 'duplicate'`) instead of posting twice.
+     */
+    sendChannelMessage: (
+      channelId: string,
+      body: { body: string; clientToken?: string; parentMessageId?: string | null }
+    ) => request<ChannelMessage>('POST', `/channels/${channelId}/messages`, { body })
+      .then(r => ({ message: r.data, outcome: r.raw?.outcome as 'created' | 'duplicate' })),
+
+    editChannelMessage: (channelId: string, messageId: string, body: string) =>
+      request<ChannelMessage>('PATCH', `/channels/${channelId}/messages/${messageId}`, {
+        body: { body }
+      }).then(r => r.data),
+
+    /** Soft delete. Author removes their own; a manager moderates any. Never a hard delete. */
+    deleteChannelMessage: (channelId: string, messageId: string) =>
+      request<ChannelMessage>('DELETE', `/channels/${channelId}/messages/${messageId}`)
+        .then(r => ({ message: r.data, outcome: r.raw?.outcome as string })),
+
+    markChannelRead: (channelId: string, lastReadMessageId?: string) =>
+      request<{ channelId: string; lastReadAt: string; lastReadMessageId: string | null; unreadCount: number }>(
+        'POST', `/channels/${channelId}/read`,
+        { body: lastReadMessageId ? { lastReadMessageId } : {} }).then(r => r.data),
 
     // Time
     activeTimer: (signal?: AbortSignal) =>

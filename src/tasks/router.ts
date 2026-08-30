@@ -29,6 +29,7 @@ import * as v from './validation.js';
 import {
   findStatusTemplate, planStatusTemplate, STATUS_TEMPLATES, ExistingStatus
 } from './statusTemplates.js';
+import { registerChannelRoutes } from './channelsRouter.js';
 
 interface Ctx {
   workspaceId: string;
@@ -736,6 +737,14 @@ export function createTaskRouter(): express.Router {
       visibility
     });
   }, { requiresTimeTracking: true }));
+
+  // ── Channels ────────────────────────────────────────────────────────────────────────
+  // Registered BEFORE the '/:id' task route below, for the same reason the timer and status
+  // routes are: Express matches in registration order, so '/channels' declared after '/:id'
+  // would be captured as a task id and never reach these handlers. They share this router, and
+  // therefore the identical guard chain — the flag, rollout, entitlement and actor resolution
+  // above all apply to every channel route without being restated.
+  registerChannelRoutes(router, guard, recordActivity);
 
   // ── Tasks ───────────────────────────────────────────────────────────────────────────
   router.get('/', guard('read', async (req, res, ctx) => {
