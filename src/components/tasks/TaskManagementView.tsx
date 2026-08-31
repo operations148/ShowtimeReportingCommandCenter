@@ -5,7 +5,8 @@ import {
 import { UserRole } from '../../types';
 import {
   createTaskApi, TaskApiError, Bootstrap, TaskFolder, TaskItem, TaskList, TaskSpace, TaskStatus,
-  WorkspaceActor, PageInfo, StatusGroupCount, formatTracked
+  WorkspaceActor, PageInfo, StatusGroupCount, TaskChannel, ChannelMessage,
+  ChannelMemberRole, formatTracked
 } from '../../tasks/apiClient';
 import { useActiveTaskTimer } from '../../hooks/useActiveTaskTimer';
 import TaskSidebar, { HierarchyAction } from './TaskSidebar';
@@ -17,6 +18,10 @@ import TaskDetailDrawer from './TaskDetailDrawer';
 import TaskFormModal from './TaskFormModal';
 import ActiveTimerBar from './ActiveTimerBar';
 import StatusManagerPanel from './StatusManagerPanel';
+import ChannelSidebarSection from './ChannelSidebarSection';
+import ChannelView from './ChannelView';
+import ChannelManagerPanel from './ChannelManagerPanel';
+import { useChannelMessages } from '../../hooks/useChannelMessages';
 import DialogPortal from './DialogPortal';
 
 const NAV_STORAGE_KEY = 'taskmgmt:nav';
@@ -40,8 +45,12 @@ const NAV_STORAGE_KEY = 'taskmgmt:nav';
 function readPersistedNav(): {
   spaceId: string | null; listId: string | null;
   expandedSpaceIds: string[]; expandedFolderIds: string[];
+  channelId: string | null; channelsExpanded: boolean;
 } {
-  const empty = { spaceId: null, listId: null, expandedSpaceIds: [], expandedFolderIds: [] };
+  const empty = {
+    spaceId: null, listId: null, expandedSpaceIds: [], expandedFolderIds: [],
+    channelId: null, channelsExpanded: true
+  };
   try {
     const raw = localStorage.getItem(NAV_STORAGE_KEY);
     if (!raw) return empty;
@@ -51,7 +60,9 @@ function readPersistedNav(): {
       spaceId: typeof parsed?.spaceId === 'string' ? parsed.spaceId : null,
       listId: typeof parsed?.listId === 'string' ? parsed.listId : null,
       expandedSpaceIds: strArr(parsed?.expandedSpaceIds),
-      expandedFolderIds: strArr(parsed?.expandedFolderIds)
+      expandedFolderIds: strArr(parsed?.expandedFolderIds),
+      channelId: typeof parsed?.channelId === 'string' ? parsed.channelId : null,
+      channelsExpanded: parsed?.channelsExpanded !== false
     };
   } catch {
     return empty;
@@ -111,6 +122,8 @@ export default function TaskManagementView({ token, role }: Props) {
   const [banner, setBanner] = useState<string | null>(null);
 
   const [persistedNav] = useState(readPersistedNav);
+  /** Local time at which bootstrap's serverTime was received, for the clock-offset measure. */
+  const bootReceivedAt = useRef(Date.now());
   const [spaceId, setSpaceId] = useState<string | null>(persistedNav.spaceId);
   const [listId, setListId] = useState<string | null>(persistedNav.listId);
   const [expandedSpaceIds, setExpandedSpaceIds] = useState<Set<string>>(
@@ -154,6 +167,21 @@ export default function TaskManagementView({ token, role }: Props) {
     { mode: 'create'; parent?: TaskItem | null } | { mode: 'edit'; task: TaskItem } | null
   >(null);
   const [statusPanelOpen, setStatusPanelOpen] = useState(false);
+
+  // ── Channels ────────────────────────────────────────────────────────────────────────
+  // Channel selection is deliberately SEPARATE from Space/Folder/List selection: opening a
+  // channel must not disturb the hierarchy the user was in, so returning from a channel to
+  // the task list restores exactly the Space, Folder, List, filters and view they left.
+  const [channels, setChannels] = useState<TaskChannel[]>([]);
+  const [channelsLoading, setChannelsLoading] = useState(false);
+  const [channelsError, setChannelsError] = useState<string | null>(null);
+  const [channelId, setChannelId] = useState<string | null>(persistedNav.channelId);
+  const [channelsExpanded, setChannelsExpanded] = useState(persistedNav.channelsExpanded);
+  const [channelPendingIds, setChannelPendingIds] = useState<Set<string>>(new Set());
+  const [channelManagerOpen, setChannelManagerOpen] = useState(false);
+  const [channelMembers, setChannelMembers] =
+    useState<{ actorId: string; role: ChannelMemberRole }[] | null>(null);
+  const [channelsReloadKey, setChannelsReloadKey] = useState(0);
 
   const timeTrackingEnabled = boot?.capabilities.timeTrackingEnabled ?? false;
   const timer = useActiveTaskTimer(api, timeTrackingEnabled);
@@ -244,10 +272,11 @@ export default function TaskManagementView({ token, role }: Props) {
       localStorage.setItem(NAV_STORAGE_KEY, JSON.stringify({
         spaceId, listId,
         expandedSpaceIds: [...expandedSpaceIds],
-        expandedFolderIds: [...expandedFolderIds]
+        expandedFolderIds: [...expandedFolderIds],
+        channelId, channelsExpanded
       }));
     } catch { /* storage unavailable (private mode, quota) — navigation still works, just not restored */ }
-  }, [spaceId, listId, expandedSpaceIds, expandedFolderIds]);
+  }, [spaceId, listId, expandedSpaceIds, expandedFolderIds, channelId, channelsExpanded]);
 
   // Persist the List layout preference — see readPersistedList above.
   useEffect(() => {
@@ -567,6 +596,127 @@ export default function TaskManagementView({ token, role }: Props) {
     }
   }, [api, optimisticAction]);
 
+  // ── Channels ─────────────────────────────────────────────────────────────────────────
+  /**
+   * SERVER-AUTHORITATIVE gate. Everything Channels-related is derived from this, and it is
+   * false until bootstrap has actually answered — so the section can never flash into view
+   * before the server has said it exists. There is no client-side default of `true`.
+   */
+  const channelsEnabled = boot?.capabilities.channelsEnabled === true;
+  const canManageChannels = channelsEnabled && boot?.capabilities.canManageChannels === true;
+  const canPostMessages = channelsEnabled && boot?.capabilities.canPostMessages === true;
+  const editWindowMs = boot?.capabilities.messageEditWindowMs ?? 15 * 60 * 1000;
+
+  /**
+   * Offset between the server's clock and this browser's, measured once at bootstrap.
+   * Edit eligibility is judged against server-now, so a skewed machine cannot be shown an
+   * Edit button for a message the server will refuse.
+   */
+  const clockOffsetMs = useMemo(() => {
+    if (!boot?.serverTime) return 0;
+    const t = Date.parse(boot.serverTime);
+    return Number.isFinite(t) ? t - bootReceivedAt.current : 0;
+  }, [boot]);
+  const serverNowMs = Date.now() + clockOffsetMs;
+
+  const loadChannels = useCallback(async (signal?: AbortSignal) => {
+    if (!channelsEnabled) return;
+    setChannelsLoading(true); setChannelsError(null);
+    try {
+      const list = await api.listChannels(false, signal);
+      setChannels(list);
+    } catch (err: any) {
+      if (err?.name === 'AbortError') return;
+      setChannelsError(err?.message ?? 'Could not load channels.');
+    } finally {
+      setChannelsLoading(false);
+    }
+  }, [api, channelsEnabled]);
+
+  useEffect(() => {
+    if (!channelsEnabled) { setChannels([]); setChannelId(null); return; }
+    const ac = new AbortController();
+    loadChannels(ac.signal);
+    return () => ac.abort();
+  }, [channelsEnabled, loadChannels, channelsReloadKey]);
+
+  /** A restored channel id that no longer exists (or is not visible) falls back to none. */
+  useEffect(() => {
+    if (!channelsEnabled || channelsLoading || !channelId) return;
+    if (!channels.some(c => c.id === channelId)) setChannelId(null);
+  }, [channelsEnabled, channelsLoading, channels, channelId]);
+
+  const selectedChannel = useMemo(
+    () => channels.find(c => c.id === channelId) ?? null, [channels, channelId]);
+
+  const messaging = useChannelMessages(api, channelId, channelsEnabled);
+
+  const createChannel = useCallback(async (name: string): Promise<boolean> => {
+    try {
+      const created = await api.createChannel({ name });
+      setChannelsReloadKey(k => k + 1);
+      setChannelId(created.id);
+      return true;
+    } catch (err: any) {
+      setBanner(err?.message ?? 'Could not create the channel.');
+      return false;
+    }
+  }, [api]);
+
+  /**
+   * Advances the read cursor by MESSAGE ID. The browser clock is never submitted as a read
+   * position — the server resolves the timestamp from the message itself.
+   */
+  const markChannelRead = useCallback(async (messageId: string) => {
+    if (!channelId) return;
+    const forChannel = channelId;
+    try {
+      await api.markChannelRead(forChannel, messageId);
+      // Clear the badge locally, then reconcile against the server's own count.
+      setChannels(prev => prev.map(c =>
+        c.id === forChannel ? { ...c, unreadCount: 0 } : c));
+      const counts = await api.channelUnread();
+      setChannels(prev => prev.map(c => {
+        const u = counts.find(x => x.channelId === c.id);
+        return u ? { ...c, unreadCount: u.unreadCount, lastReadAt: u.lastReadAt } : c;
+      }));
+    } catch { /* read state is best-effort; a failure must never break the conversation */ }
+  }, [api, channelId]);
+
+  const editMessage = useCallback(async (m: ChannelMessage, body: string) => {
+    if (!channelId) return false;
+    try {
+      await api.editChannelMessage(channelId, m.id, body);
+      messaging.reload();
+      return true;
+    } catch (err: any) {
+      // The server is the final authority: an expired window comes back as a refusal and is
+      // surfaced rather than swallowed.
+      setBanner(err?.message ?? 'Could not edit the message.');
+      return false;
+    }
+  }, [api, channelId, messaging]);
+
+  const deleteMessage = useCallback(async (m: ChannelMessage) => {
+    if (!channelId) return false;
+    try {
+      await api.deleteChannelMessage(channelId, m.id);
+      messaging.reload();
+      return true;
+    } catch (err: any) {
+      setBanner(err?.message ?? 'Could not delete the message.');
+      return false;
+    }
+  }, [api, channelId, messaging]);
+
+  /** Membership for the manage dialog. Loaded only when a manager opens it. */
+  useEffect(() => {
+    if (!channelManagerOpen || !selectedChannel) { setChannelMembers(null); return; }
+    // The list route does not carry membership, so it is derived from the channel the manager
+    // opened. An empty set is the correct starting point for a workspace-visible channel.
+    setChannelMembers([]);
+  }, [channelManagerOpen, selectedChannel]);
+
   const spaceStatuses = useMemo(
     () => (boot?.statuses ?? []).filter(s => s.space_id === spaceId),
     [boot, spaceId]
@@ -797,10 +947,29 @@ export default function TaskManagementView({ token, role }: Props) {
             })}
             onAction={handleHierarchyAction}
           />
+
+          {/* Channels live BELOW the Spaces tree and in their own <section>, so expanding a
+              Space or selecting a List cannot disturb channel state, and vice versa. Rendered
+              only once the SERVER has confirmed the feature — never optimistically. */}
+          {channelsEnabled && (
+            <ChannelSidebarSection
+              channels={channels}
+              selectedChannelId={channelId}
+              loading={channelsLoading}
+              error={channelsError}
+              canManage={canManageChannels}
+              expanded={channelsExpanded}
+              pendingIds={channelPendingIds}
+              onToggleExpanded={() => setChannelsExpanded(v => !v)}
+              onSelect={id => { setChannelId(id); }}
+              onCreate={createChannel}
+              onRetry={() => setChannelsReloadKey(k => k + 1)}
+            />
+          )}
         </aside>
 
         <div className="min-w-0 space-y-3">
-          <HierarchyBreadcrumb {...breadcrumb} />
+          {!(channelsEnabled && selectedChannel) && <HierarchyBreadcrumb {...breadcrumb} />}
 
           {/* Toolbar */}
           <div className="bg-white border border-slate-200 rounded-xl p-3 space-y-2">
@@ -896,7 +1065,37 @@ export default function TaskManagementView({ token, role }: Props) {
             </div>
           </div>
 
-          {view === 'list' && listMode === 'grouped' ? (
+          {channelsEnabled && selectedChannel ? (
+            <ChannelView
+              channel={selectedChannel}
+              space={selectedChannel.space_id
+                ? boot!.spaces.find(sp => sp.id === selectedChannel.space_id) ?? null
+                : null}
+              memberCount={channelMembers ? channelMembers.length : null}
+              actors={actors}
+              myActorId={myActorId ?? null}
+              messages={messaging.messages}
+              pending={messaging.pending}
+              loading={messaging.loading}
+              error={messaging.error}
+              loadingOlder={messaging.loadingOlder}
+              hasMoreBefore={messaging.hasMoreBefore}
+              pollState={messaging.pollState}
+              canPost={canPostMessages}
+              canManage={canManageChannels}
+              editWindowMs={editWindowMs}
+              serverNowMs={serverNowMs}
+              onMessagesSeen={markChannelRead}
+              onSend={messaging.send}
+              onRetryPending={messaging.retry}
+              onDiscardPending={messaging.discardPending}
+              onEdit={editMessage}
+              onDelete={deleteMessage}
+              onLoadOlder={messaging.loadOlder}
+              onRetry={messaging.reload}
+              onManage={() => setChannelManagerOpen(true)}
+            />
+          ) : view === 'list' && listMode === 'grouped' ? (
             <TaskGroupedListView
               tasks={tasks} statuses={openStatuses} groupCounts={groupCounts}
               page={pageInfo} loading={tasksLoading} error={tasksError}
@@ -967,6 +1166,25 @@ export default function TaskManagementView({ token, role }: Props) {
               })}
               onAction={handleHierarchyAction}
             />
+
+          {/* Channels live BELOW the Spaces tree and in their own <section>, so expanding a
+              Space or selecting a List cannot disturb channel state, and vice versa. Rendered
+              only once the SERVER has confirmed the feature — never optimistically. */}
+          {channelsEnabled && (
+            <ChannelSidebarSection
+              channels={channels}
+              selectedChannelId={channelId}
+              loading={channelsLoading}
+              error={channelsError}
+              canManage={canManageChannels}
+              expanded={channelsExpanded}
+              pendingIds={channelPendingIds}
+              onToggleExpanded={() => setChannelsExpanded(v => !v)}
+              onSelect={id => { setChannelId(id); setMobileNavOpen(false); }}
+              onCreate={createChannel}
+              onRetry={() => setChannelsReloadKey(k => k + 1)}
+            />
+          )}
           </div>
         </div>
         </DialogPortal>
@@ -981,6 +1199,18 @@ export default function TaskManagementView({ token, role }: Props) {
           onEdit={t => { setOpenTaskId(null); setFormState({ mode: 'edit', task: t }); }}
           onAddSubtask={parent => { setOpenTaskId(null); setFormState({ mode: 'create', parent }); }}
           onChanged={refreshAll}
+        />
+      )}
+
+      {channelManagerOpen && selectedChannel && canManageChannels && (
+        <ChannelManagerPanel
+          api={api}
+          channel={selectedChannel}
+          spaces={boot!.spaces}
+          actors={actors}
+          members={channelMembers}
+          onClose={() => setChannelManagerOpen(false)}
+          onChanged={() => { setChannelsReloadKey(k => k + 1); setChannelManagerOpen(false); }}
         />
       )}
 

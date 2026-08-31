@@ -18,7 +18,9 @@ import {
   ok, fail, handler, TaskError, notFound, invalid, versionConflict, mapDbError, applyNoStore,
   folderNotEmpty, folderCrossSpace
 } from './http.js';
-import { isTaskManagementEnabled, isTaskTimeTrackingEnabled } from './config.js';
+import {
+  isTaskManagementEnabled, isTaskTimeTrackingEnabled, isTaskChannelsEnabled
+} from './config.js';
 import { assertWorkspaceInRollout, RolloutExemptOperation } from './rollout.js';
 import { resolveActor, requireResolvedActor, ResolvedActor } from './actors.js';
 import {
@@ -30,6 +32,7 @@ import {
   findStatusTemplate, planStatusTemplate, STATUS_TEMPLATES, ExistingStatus
 } from './statusTemplates.js';
 import { registerChannelRoutes } from './channelsRouter.js';
+import { EDIT_WINDOW_MS } from './channels.js';
 
 interface Ctx {
   workspaceId: string;
@@ -195,8 +198,28 @@ export function createTaskRouter(): express.Router {
         canAssignOthers: perm.isManager(ctx.role),
         timeVisibility: perm.timeVisibilityFor(ctx.role),
         timeTrackingEnabled: isTaskTimeTrackingEnabled(),
+        /**
+         * The SERVER's answer on whether Channels exist for this caller, derived from the
+         * same fail-closed isTaskChannelsEnabled() the channel routes themselves enforce.
+         * The client hides the whole Channels surface when this is false; the routes still
+         * reject independently, so hiding remains an affordance and never a boundary.
+         */
+        channelsEnabled: isTaskChannelsEnabled(),
+        /** Manager-only: create, rename, archive channels and manage membership. */
+        canManageChannels: isTaskChannelsEnabled() && perm.isManager(ctx.role),
+        /** Managers and contributors may post; READ_ONLY may read a channel but not write. */
+        canPostMessages: isTaskChannelsEnabled() &&
+          (perm.isManager(ctx.role) || perm.isContributor(ctx.role)),
+        /** Surfaced so the client can present the edit window without hard-coding it. */
+        messageEditWindowMs: EDIT_WINDOW_MS,
         actorResolved: ctx.actor !== null
-      }
+      },
+      /**
+       * The SERVER's clock at bootstrap. The client uses it (plus elapsed local time) to judge
+       * whether a message is still inside its edit window, so a skewed browser clock cannot
+       * offer an Edit button for a message the server will refuse.
+       */
+      serverTime: new Date().toISOString()
     });
   }));
 

@@ -127,7 +127,57 @@ export const subtask = task({
   subtaskCount: 0, assigneeActorIds: []
 });
 
-export function capabilitiesFor(role: Role) {
+export const CHANNEL_A = '99999999-9999-4999-8999-999999999991';
+export const CHANNEL_B = '99999999-9999-4999-8999-999999999992';
+export const CHANNEL_PRIVATE = '99999999-9999-4999-8999-999999999993';
+
+export const MSG_1 = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaa1';
+export const MSG_2 = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaa2';
+export const MSG_REPLY = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaa3';
+export const MSG_DELETED = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaa4';
+
+/**
+ * Two messages inside the SAME millisecond with different microseconds — the exact shape that
+ * caused the Production skip. The second sorts LEXICALLY FIRST by uuid, so a millisecond-only
+ * comparison would order them wrongly.
+ */
+export const TS_A = '2026-08-31T14:12:37.123455+00:00';
+export const TS_B = '2026-08-31T14:12:37.123456+00:00';
+export const TS_C = '2026-08-31T14:12:38.000001+00:00';
+
+export const channels = [
+  { id: CHANNEL_A, space_id: null, name: 'Lounge', slug: 'lounge',
+    description: 'Everything and nothing', visibility: 'workspace',
+    position: 1000, version: 1, archived_at: null,
+    created_at: '2026-08-01T09:00:00+00:00', updated_at: '2026-08-01T09:00:00+00:00' },
+  { id: CHANNEL_B, space_id: SPACE_A, name: 'Showtime Pools Main', slug: 'showtime-pools-main',
+    description: null, visibility: 'workspace',
+    position: 2000, version: 1, archived_at: null,
+    created_at: '2026-08-01T09:00:00+00:00', updated_at: '2026-08-01T09:00:00+00:00' },
+  { id: CHANNEL_PRIVATE, space_id: null, name: 'Ops Private', slug: 'ops-private',
+    description: null, visibility: 'restricted',
+    position: 3000, version: 1, archived_at: null,
+    created_at: '2026-08-01T09:00:00+00:00', updated_at: '2026-08-01T09:00:00+00:00' }
+];
+
+export const channelMessages = [
+  { id: MSG_1, channel_id: CHANNEL_A, author_actor_id: ACTOR_OTHER,
+    body: 'Pump inspection is booked for Friday.', parent_message_id: null,
+    edited_at: null, deleted_at: null, created_at: TS_A, updated_at: TS_A },
+  { id: MSG_2, channel_id: CHANNEL_A, author_actor_id: ACTOR_ME,
+    body: 'Thanks — I will bring the readings.', parent_message_id: null,
+    edited_at: null, deleted_at: null, created_at: TS_B, updated_at: TS_B },
+  { id: MSG_REPLY, channel_id: CHANNEL_A, author_actor_id: ACTOR_OTHER,
+    body: 'Perfect.', parent_message_id: MSG_1,
+    edited_at: null, deleted_at: null, created_at: TS_C, updated_at: TS_C },
+  { id: MSG_DELETED, channel_id: CHANNEL_A, author_actor_id: ACTOR_OTHER,
+    body: 'this should never be shown', parent_message_id: null,
+    edited_at: null, deleted_at: '2026-08-31T15:00:00+00:00',
+    created_at: '2026-08-31T14:12:39.000001+00:00',
+    updated_at: '2026-08-31T15:00:00+00:00' }
+];
+
+export function capabilitiesFor(role: Role, over: Partial<any> = {}) {
   const manager = ['SUPER_ADMIN', 'WORKSPACE_OWNER', 'ADMIN'].includes(role);
   const contributor = ['SALES_REP', 'TEAM_MEMBER'].includes(role);
   return {
@@ -136,8 +186,27 @@ export function capabilitiesFor(role: Role) {
     canAssignOthers: manager,
     timeVisibility: manager ? 'team' : contributor ? 'own' : 'aggregate_only',
     timeTrackingEnabled: true,
-    actorResolved: true
+    // FAIL-CLOSED by default, exactly as the server is: a test that wants Channels must opt
+    // in, so no existing spec acquires a Channels surface it never asked for.
+    channelsEnabled: false,
+    canManageChannels: false,
+    canPostMessages: false,
+    messageEditWindowMs: 15 * 60 * 1000,
+    actorResolved: true,
+    ...over
   };
+}
+
+/** Capabilities with Channels switched on, mirroring what the server derives per role. */
+export function channelCapabilitiesFor(role: Role, over: Partial<any> = {}) {
+  const manager = ['SUPER_ADMIN', 'WORKSPACE_OWNER', 'ADMIN'].includes(role);
+  const contributor = ['SALES_REP', 'TEAM_MEMBER'].includes(role);
+  return capabilitiesFor(role, {
+    channelsEnabled: true,
+    canManageChannels: manager,
+    canPostMessages: manager || contributor,
+    ...over
+  });
 }
 
 export function bootstrapFor(role: Role, over: Partial<any> = {}) {
@@ -145,6 +214,7 @@ export function bootstrapFor(role: Role, over: Partial<any> = {}) {
     spaces, folders, lists, statuses,
     activeTimer: null,
     capabilities: capabilitiesFor(role),
+    serverTime: '2026-08-31T14:12:40.000000+00:00',
     ...over
   };
 }

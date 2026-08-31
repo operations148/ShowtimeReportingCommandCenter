@@ -76,10 +76,23 @@ export interface ActivityEvent {
 export interface Capabilities {
   canManageHierarchy: boolean; canCreateTask: boolean; canAssignOthers: boolean;
   timeVisibility: TimeVisibility; timeTrackingEnabled: boolean; actorResolved: boolean;
+  /**
+   * The SERVER's answer on whether Channels exist for this caller. The client hides the whole
+   * Channels surface when this is false, but the routes reject independently — hiding is an
+   * affordance, never the boundary. Optional so a bootstrap from an older deployment (which
+   * omits it) is treated as disabled rather than crashing.
+   */
+  channelsEnabled?: boolean;
+  canManageChannels?: boolean;
+  canPostMessages?: boolean;
+  /** Edit window in ms, so the client never hard-codes the server's policy. */
+  messageEditWindowMs?: number;
 }
 export interface Bootstrap {
   spaces: TaskSpace[]; folders: TaskFolder[]; lists: TaskList[]; statuses: TaskStatus[];
   activeTimer: ActiveTimer | null; capabilities: Capabilities;
+  /** Server clock at bootstrap; the client judges the edit window against this, not its own. */
+  serverTime?: string;
 }
 export interface PageInfo { page: number; pageSize: number; total: number; }
 

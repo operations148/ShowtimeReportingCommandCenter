@@ -1,6 +1,12 @@
 import { test as base, expect, type Page, type Route } from '@playwright/test';
 import * as F from './fixtures';
 import { STATUS_TEMPLATES, findStatusTemplate, planStatusTemplate } from '../src/tasks/statusTemplates';
+// The harness uses the SHIPPED cursor logic, so it cannot drift from the microsecond-exact
+// implementation the router relies on.
+import {
+  encodeCursor, decodeCursor, compareCursor, cursorOf,
+  trimToStrictlyAfter, trimToStrictlyBefore
+} from '../src/tasks/channels';
 
 /**
  * TEST-ONLY request interception harness.
@@ -34,6 +40,10 @@ type ApiState = {
    *  canned summary regardless of what the timer/manual-entry routes did, which could never
    *  have caught the List-row staleness bug this fixture now exists to test. */
   timeEntries: any[];
+  channels: any[];
+  channelMessages: any[];
+  channelReads: Map<string, string>;
+  channelMembers: Map<string, string[]>;
   overrides: Map<string, { status: number; body: string; sticky?: boolean }>;
   hold: Set<string>;
   seen: string[];
@@ -93,6 +103,8 @@ export async function installApi(
     lists?: any[];
     statuses?: any[];
     timeEntries?: any[];
+    channels?: any[];
+    channelMessages?: any[];
   } = {}
 ): Promise<Harness> {
   const role = opts.role ?? 'ADMIN';
@@ -102,6 +114,10 @@ export async function installApi(
     caps: { ...F.capabilitiesFor(role), ...(opts.caps ?? {}) },
     tasks: JSON.parse(JSON.stringify(opts.tasks ?? F.tasks)),
     statuses: JSON.parse(JSON.stringify(opts.statuses ?? F.statuses)),
+    channels: JSON.parse(JSON.stringify(opts.channels ?? F.channels)),
+    channelMessages: JSON.parse(JSON.stringify(opts.channelMessages ?? F.channelMessages)),
+    channelReads: new Map<string, string>(),
+    channelMembers: new Map<string, string[]>(),
     lists: JSON.parse(JSON.stringify(opts.lists ?? F.lists)),
     spaces: JSON.parse(JSON.stringify(opts.spaces ?? F.spaces)),
     folders: JSON.parse(JSON.stringify(opts.folders ?? F.folders)),
@@ -213,7 +229,9 @@ function handleTasks(
       lists: s.lists,
       statuses: s.statuses,
       activeTimer: s.activeTimer,
-      capabilities: s.caps
+      capabilities: s.caps,
+      // The server's clock, used by the client to judge the edit window.
+      serverTime: '2026-08-31T14:12:40.000000+00:00'
     })];
   }
 
@@ -509,6 +527,221 @@ function handleTasks(
       row.version += 1;
       return [200, ok(row)];
     }
+  }
+
+  // ---- Channels ---------------------------------------------------------
+  // Mirrors src/tasks/channelsRouter.ts: same paths, same envelope, same error codes, and
+  // the same fail-closed flag check ahead of everything else.
+  if (seg[0] === 'channels') {
+    if (!s.caps.channelsEnabled) {
+      return [403, fail('TASK_CHANNELS_DISABLED', 'Channels are not enabled.')];
+    }
+
+    const visible = () => s.channels.filter((c: any) =>
+      c.visibility !== 'restricted' ||
+      s.caps.canManageChannels ||
+      (s.channelMembers.get(c.id) ?? []).includes(F.ACTOR_ME));
+
+    const unreadFor = (c: any) => {
+      const since = s.channelReads.get(c.id);
+      return s.channelMessages.filter((m: any) =>
+        m.channel_id === c.id && !m.deleted_at && m.author_actor_id !== F.ACTOR_ME &&
+        (!since || m.created_at > since)).length;
+    };
+
+    // GET /channels/unread — registered before /:channelId, as in the router.
+    if (method === 'GET' && seg[1] === 'unread') {
+      return [200, ok(visible().map((c: any) => ({
+        channelId: c.id, unreadCount: unreadFor(c),
+        lastReadAt: s.channelReads.get(c.id) ?? null
+      })))];
+    }
+
+    if (method === 'GET' && seg.length === 1) {
+      const includeArchived = q.get('includeArchived') === 'true';
+      const rows = visible()
+        .filter((c: any) => includeArchived || !c.archived_at)
+        .sort((a: any, b: any) => a.position - b.position)
+        .map((c: any) => ({
+          ...c, unreadCount: unreadFor(c),
+          lastReadAt: s.channelReads.get(c.id) ?? null
+        }));
+      return [200, ok(rows)];
+    }
+
+    if (method === 'POST' && seg.length === 1) {
+      if (!s.caps.canManageChannels) {
+        return [403, fail('TASK_FORBIDDEN', 'Only a manager can create channels.')];
+      }
+      const name = String(body.name ?? '').trim();
+      if (!name) return [400, fail('TASK_VALIDATION_FAILED', 'name is required.')];
+      const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+      if (s.channels.some((c: any) => c.slug === slug && !c.archived_at)) {
+        return [409, fail('TASK_VALIDATION_FAILED',
+          'A channel with that name already exists in this workspace.')];
+      }
+      const created = {
+        id: `channel-new-${s.channels.length + 1}`, space_id: body.spaceId ?? null,
+        name, slug, description: body.description ?? null,
+        visibility: body.visibility ?? 'workspace',
+        position: (s.channels.length + 1) * 1000, version: 1, archived_at: null,
+        created_at: '2026-08-31T14:13:00.000000+00:00',
+        updated_at: '2026-08-31T14:13:00.000000+00:00'
+      };
+      s.channels.push(created);
+      return [201, ok(created)];
+    }
+
+    const channelId = seg[1];
+    const channel = s.channels.find((c: any) => c.id === channelId);
+    if (!channel) return [404, fail('TASK_NOT_FOUND', 'Channel not found.')];
+    if (channel.visibility === 'restricted' && !s.caps.canManageChannels &&
+        !(s.channelMembers.get(channel.id) ?? []).includes(F.ACTOR_ME)) {
+      return [403, fail('TASK_CHANNEL_FORBIDDEN', 'You do not have access to this channel.')];
+    }
+
+    if (method === 'PATCH' && seg.length === 2) {
+      if (!s.caps.canManageChannels) {
+        return [403, fail('TASK_FORBIDDEN', 'Only a manager can manage channels.')];
+      }
+      if (body.name !== undefined) {
+        const n = String(body.name).trim();
+        if (!n) return [400, fail('TASK_VALIDATION_FAILED', 'name is required.')];
+        channel.name = n;
+        channel.slug = n.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+      }
+      if (body.description !== undefined) channel.description = body.description;
+      if (body.visibility !== undefined) channel.visibility = body.visibility;
+      if (body.spaceId !== undefined) channel.space_id = body.spaceId;
+      if (body.archived === true) channel.archived_at = '2026-08-31T16:00:00.000000+00:00';
+      if (body.archived === false) channel.archived_at = null;
+      channel.version += 1;
+      return [200, ok(channel)];
+    }
+
+    if (method === 'PUT' && seg[2] === 'members') {
+      if (!s.caps.canManageChannels) {
+        return [403, fail('TASK_FORBIDDEN', 'Only a manager can manage channels.')];
+      }
+      const members = Array.isArray(body.members) ? body.members : [];
+      s.channelMembers.set(channel.id, members.map((m: any) => m.actorId));
+      return [200, ok({ channelId: channel.id, members })];
+    }
+
+    if (seg[2] === 'read' && method === 'POST') {
+      const mid = body.lastReadMessageId;
+      // The server resolves the timestamp from the MESSAGE, never from the client.
+      const m = mid
+        ? s.channelMessages.find((x: any) => x.id === mid && x.channel_id === channel.id)
+        : [...s.channelMessages].filter((x: any) => x.channel_id === channel.id).pop();
+      if (!m) return [200, ok({ channelId: channel.id, lastReadAt: null,
+        lastReadMessageId: null, unreadCount: 0 })];
+      s.channelReads.set(channel.id, m.created_at);
+      return [200, ok({ channelId: channel.id, lastReadAt: m.created_at,
+        lastReadMessageId: m.id, unreadCount: 0 })];
+    }
+
+    if (seg[2] === 'messages') {
+      const present = (m: any) => ({
+        id: m.id, channelId: m.channel_id,
+        authorActorId: m.deleted_at ? null : m.author_actor_id,
+        body: m.deleted_at ? null : m.body,
+        parentMessageId: m.parent_message_id,
+        editedAt: m.edited_at, deletedAt: m.deleted_at,
+        createdAt: m.created_at, updatedAt: m.updated_at,
+        cursor: encodeCursor({ createdAt: m.created_at, id: m.id })
+      });
+
+      if (method === 'GET') {
+        const limit = Math.min(Number(q.get('limit') ?? 50), 100);
+        const all = s.channelMessages
+          .filter((m: any) => m.channel_id === channel.id)
+          .sort((a: any, b: any) =>
+            compareCursor(cursorOf(a) as any, cursorOf(b) as any));
+        const after = q.get('after') ? decodeCursor(q.get('after'), 'after') : null;
+        const before = q.get('before') ? decodeCursor(q.get('before'), 'before') : null;
+
+        let rows: any[];
+        let hasMoreBefore = false;
+        if (after) {
+          rows = trimToStrictlyAfter(all as any, after).slice(0, limit);
+        } else if (before) {
+          const t = trimToStrictlyBefore(all as any, before);
+          hasMoreBefore = t.length > limit;
+          rows = t.slice(-limit);
+        } else {
+          hasMoreBefore = all.length > limit;
+          rows = all.slice(-limit);
+        }
+        const out = rows.map(present);
+        return [200, ok(out, {
+          page: {
+            limit,
+            nextAfter: out.length ? out[out.length - 1].cursor
+              : (after ? encodeCursor(after) : null),
+            nextBefore: out.length ? out[0].cursor
+              : (before ? encodeCursor(before) : null),
+            hasMoreBefore
+          }
+        })];
+      }
+
+      if (method === 'POST') {
+        if (!s.caps.canPostMessages) {
+          return [403, fail('TASK_FORBIDDEN', 'Your role cannot post messages.')];
+        }
+        if (channel.archived_at) {
+          return [409, fail('TASK_CHANNEL_ARCHIVED', 'This channel is archived.')];
+        }
+        const text = String(body.body ?? '').trim();
+        if (!text) return [400, fail('TASK_VALIDATION_FAILED', 'Message body cannot be empty.')];
+        // Idempotency: the same token from the same author returns the ORIGINAL message.
+        const dup = body.clientToken && s.channelMessages.find(
+          (m: any) => m.client_token === body.clientToken &&
+            m.channel_id === channel.id && m.author_actor_id === F.ACTOR_ME);
+        if (dup) return [200, ok(present(dup), { outcome: 'duplicate' })];
+
+        const n = s.channelMessages.length + 1;
+        const created = {
+          id: `msg-new-${n}`, channel_id: channel.id, author_actor_id: F.ACTOR_ME,
+          body: text, parent_message_id: body.parentMessageId ?? null,
+          client_token: body.clientToken ?? null,
+          edited_at: null, deleted_at: null,
+          // Server-generated, microsecond precision, strictly after the fixtures.
+          created_at: `2026-08-31T14:20:0${n}.${String(n).padStart(6, '0')}+00:00`,
+          updated_at: `2026-08-31T14:20:0${n}.${String(n).padStart(6, '0')}+00:00`
+        };
+        s.channelMessages.push(created);
+        return [201, ok(present(created), { outcome: 'created' })];
+      }
+
+      const messageId = seg[3];
+      const msg = s.channelMessages.find(
+        (m: any) => m.id === messageId && m.channel_id === channel.id);
+      if (!msg) return [404, fail('TASK_NOT_FOUND', 'Message not found.')];
+
+      if (method === 'PATCH') {
+        if (msg.deleted_at) return [409, fail('TASK_MESSAGE_DELETED', 'That message has been deleted.')];
+        if (msg.author_actor_id !== F.ACTOR_ME) {
+          return [403, fail('TASK_FORBIDDEN', 'You can only edit your own messages.')];
+        }
+        msg.body = String(body.body ?? '').trim();
+        msg.edited_at = '2026-08-31T14:30:00.000000+00:00';
+        return [200, ok(present(msg))];
+      }
+
+      if (method === 'DELETE') {
+        const mine = msg.author_actor_id === F.ACTOR_ME;
+        if (!mine && !s.caps.canManageChannels) {
+          return [403, fail('TASK_FORBIDDEN', 'You can only delete your own messages.')];
+        }
+        if (msg.deleted_at) return [200, ok(present(msg), { outcome: 'already_deleted' })];
+        msg.deleted_at = '2026-08-31T14:35:00.000000+00:00';
+        return [200, ok(present(msg), { outcome: mine ? 'deleted' : 'moderated' })];
+      }
+    }
+
+    return [405, fail('TASK_VALIDATION_FAILED', 'Unsupported channel operation.')];
   }
 
   // ---- Task collection --------------------------------------------------
