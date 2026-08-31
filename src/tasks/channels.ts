@@ -179,15 +179,96 @@ export function optionalClientToken(value: unknown): string | null {
 
 // ── Keyset cursors ─────────────────────────────────────────────────────────────────────
 
+/**
+ * PRECISION CONTRACT — the reason this section does not use `Date` anywhere.
+ *
+ * PostgreSQL stores timestamptz with MICROSECOND resolution. A JavaScript `Date` holds only
+ * MILLISECONDS, so `new Date(Date.parse(ts)).toISOString()` silently discards the low three
+ * digits. Two messages 300µs apart then collapse to the same cursor timestamp, the (created_at,
+ * id) tie-break is evaluated against the WRONG boundary, and a message that SQL ordered after
+ * the cursor can compare as before it — so it is never delivered while the cursor advances past
+ * it. That was observed in the Production canary and reproduced deterministically.
+ *
+ * The fix is to never let an ordering timestamp touch `Date`:
+ *   * The router reads through supabase-js/PostgREST, which returns timestamptz as a JSON
+ *     STRING with microseconds intact (e.g. "2026-08-31T14:12:37.123456+00:00"). That exact
+ *     text is the canonical cursor timestamp.
+ *   * The cursor carries that text VERBATIM. It is never parsed and reserialised.
+ *   * Comparison converts to integer (seconds, microseconds) purely for ordering, and never
+ *     emits a timestamp.
+ *   * The same verbatim text goes back to PostgreSQL, which parses it exactly.
+ *
+ * `isWithinEditWindow` below still uses Date deliberately: it measures a 15-minute policy
+ * window, not an ordering position, where sub-millisecond precision is meaningless.
+ */
+
+/** Bumped only when the encoded shape changes. v1 is the microsecond-exact format. */
+export const CURSOR_VERSION = 'v1';
+/** Hard bound on an encoded cursor, so a caller cannot post an unbounded string. */
+export const CURSOR_MAX_ENCODED_LENGTH = 200;
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Accepts what PostgreSQL/PostgREST actually emit for timestamptz:
+ * `YYYY-MM-DD` then `T` or a space, `HH:MM:SS`, an OPTIONAL 1-6 digit fraction (Postgres trims
+ * trailing zeros, so ".123000" arrives as ".123"), then `Z`, `+HH:MM`, `+HHMM` or `+HH`.
+ */
+const PG_TIMESTAMP_RE =
+  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}(?::?\d{2})?)?$/;
+
 export interface MessageCursor {
-  /** ISO-8601 UTC timestamp of the message the cursor points at. */
+  /**
+   * The message's created_at EXACTLY as PostgreSQL rendered it, microseconds included.
+   * Never normalised, never round-tripped through Date. Treated as opaque text.
+   */
   createdAt: string;
   /** Message id, breaking ties between messages sharing a timestamp. */
   id: string;
 }
 
+/** Integer instant, for ordering only. Never converted back into a timestamp. */
+interface Instant { seconds: number; micros: number; }
+
 /**
- * Encodes a cursor as an opaque base64url string.
+ * Parses a PostgreSQL timestamp into whole seconds plus microseconds.
+ *
+ * `Date.UTC` is used ONLY for the whole-second calendar arithmetic, where it is exact; every
+ * sub-second digit is handled as an integer and never passes through a Date. Returns null for
+ * anything that does not match the expected shape, so validation and comparison share one
+ * definition of "a timestamp we understand".
+ */
+export function parseInstant(ts: unknown): Instant | null {
+  if (typeof ts !== 'string') return null;
+  const m = PG_TIMESTAMP_RE.exec(ts.trim());
+  if (!m) return null;
+  const [, y, mo, d, hh, mm, ss, frac, zone] = m;
+
+  const utcMs = Date.UTC(+y, +mo - 1, +d, +hh, +mm, +ss);
+  if (!Number.isFinite(utcMs)) return null;
+  // Guard against Date.UTC silently normalising an impossible date (e.g. month 13).
+  if (+mo < 1 || +mo > 12 || +d < 1 || +d > 31 || +hh > 23 || +mm > 59 || +ss > 60) return null;
+
+  let offsetSeconds = 0;
+  if (zone && zone !== 'Z') {
+    const sign = zone[0] === '-' ? -1 : 1;
+    const digits = zone.slice(1).replace(':', '');
+    const oh = Number(digits.slice(0, 2));
+    const om = digits.length > 2 ? Number(digits.slice(2, 4)) : 0;
+    offsetSeconds = sign * (oh * 3600 + om * 60);
+  }
+
+  // Right-pad the fraction so ".123" and ".123000" are the same number of microseconds.
+  const micros = frac ? Number(frac.padEnd(6, '0')) : 0;
+  return { seconds: utcMs / 1000 - offsetSeconds, micros };
+}
+
+/** True when the text is a timestamp this module can order. */
+export const isOrderableTimestamp = (ts: unknown): boolean => parseInstant(ts) !== null;
+
+/**
+ * Encodes a cursor as an opaque, URL-safe, VERSIONED base64url string.
  *
  * Opaque, and deliberately NOT a sequence number. A monotonic per-table counter would be a
  * simpler cursor, but its gaps leak how many messages were written in OTHER workspaces
@@ -196,41 +277,84 @@ export interface MessageCursor {
  * read.
  */
 export function encodeCursor(c: MessageCursor): string {
-  return Buffer.from(`${c.createdAt}|${c.id}`, 'utf8').toString('base64url');
+  return Buffer.from(`${CURSOR_VERSION}|${c.createdAt}|${c.id}`, 'utf8').toString('base64url');
 }
 
+/**
+ * Decodes and fully validates a cursor.
+ *
+ * An unversioned cursor — the old, millisecond-lossy format — is REJECTED rather than
+ * reinterpreted. Treating a lossy timestamp as if it were exact is precisely the bug this
+ * change exists to remove, so the only safe response is to make the caller start again.
+ */
 export function decodeCursor(raw: unknown, field = 'cursor'): MessageCursor | null {
   if (raw === undefined || raw === null || raw === '') return null;
   if (typeof raw !== 'string') throw invalid(`${field} must be text.`);
+  if (raw.length > CURSOR_MAX_ENCODED_LENGTH) {
+    throw invalid(`${field} is not a valid cursor.`);
+  }
+
   let decoded: string;
   try {
     decoded = Buffer.from(raw, 'base64url').toString('utf8');
   } catch {
     throw invalid(`${field} is not a valid cursor.`);
   }
-  const sep = decoded.lastIndexOf('|');
-  if (sep <= 0) throw invalid(`${field} is not a valid cursor.`);
-  const createdAt = decoded.slice(0, sep);
-  const id = decoded.slice(sep + 1);
-  const ms = Date.parse(createdAt);
-  if (!Number.isFinite(ms)) throw invalid(`${field} is not a valid cursor.`);
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
-    throw invalid(`${field} is not a valid cursor.`);
-  }
-  return { createdAt: new Date(ms).toISOString(), id };
+
+  // Exactly three fields. The timestamp itself contains no '|', so splitting is unambiguous.
+  const parts = decoded.split('|');
+  if (parts.length !== 3) throw invalid(`${field} is not a valid cursor.`);
+  const [version, createdAt, id] = parts;
+
+  if (version !== CURSOR_VERSION) throw invalid(`${field} is not a valid cursor.`);
+  if (!createdAt || !id) throw invalid(`${field} is not a valid cursor.`);
+  if (!isOrderableTimestamp(createdAt)) throw invalid(`${field} is not a valid cursor.`);
+  if (!UUID_RE.test(id)) throw invalid(`${field} is not a valid cursor.`);
+
+  // createdAt is returned VERBATIM — not reserialised — so the microseconds survive the round
+  // trip and the exact text can go straight back to PostgreSQL.
+  return { createdAt, id };
 }
 
-/** Total order on the cursor pair. Negative when `a` precedes `b`. */
+/**
+ * Total order on the cursor pair, exact to the microsecond. Negative when `a` precedes `b`.
+ *
+ * Matches the SQL ordering `order by created_at asc, id asc` so the trimming below can never
+ * disagree with the order the database returned rows in.
+ */
 export function compareCursor(a: MessageCursor, b: MessageCursor): number {
-  const at = Date.parse(a.createdAt);
-  const bt = Date.parse(b.createdAt);
-  if (at !== bt) return at < bt ? -1 : 1;
+  const ia = parseInstant(a.createdAt);
+  const ib = parseInstant(b.createdAt);
+  // An unparseable timestamp must never silently compare as equal; fall back to the raw text
+  // so the ordering stays total and deterministic rather than collapsing to a tie.
+  if (!ia || !ib) {
+    if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+    if (a.id === b.id) return 0;
+    return a.id < b.id ? -1 : 1;
+  }
+  if (ia.seconds !== ib.seconds) return ia.seconds < ib.seconds ? -1 : 1;
+  if (ia.micros !== ib.micros) return ia.micros < ib.micros ? -1 : 1;
   if (a.id === b.id) return 0;
   return a.id < b.id ? -1 : 1;
 }
 
-export const cursorOf = (row: { created_at: string; id: string }): MessageCursor =>
-  ({ createdAt: new Date(Date.parse(row.created_at)).toISOString(), id: row.id });
+/**
+ * Builds a cursor from a database row, keeping created_at EXACTLY as it arrived.
+ *
+ * Throws on a Date. A Date has already lost the microseconds by the time it reaches here, and
+ * `Date.parse(dateObject)` is worse still — it stringifies to second precision. Failing loudly
+ * is the only safe response: silently accepting it would reintroduce the skipped-message bug
+ * through a different client (node-postgres returns Dates where PostgREST returns strings).
+ */
+export function cursorOf(row: { created_at: unknown; id: string }): MessageCursor {
+  if (typeof row.created_at !== 'string') {
+    throw invalid(
+      'An ordering cursor requires the raw PostgreSQL timestamp text. A Date has already ' +
+      'lost microsecond precision and cannot be used as a cursor.'
+    );
+  }
+  return { createdAt: row.created_at, id: row.id };
+}
 
 /**
  * Trims a timestamp-bounded result set down to strictly-after (or strictly-before) the cursor.
@@ -356,10 +480,19 @@ export function countUnread(
   lastReadAt: string | null,
   actorId: string
 ): number {
-  const since = lastReadAt ? Date.parse(lastReadAt) : Number.NEGATIVE_INFINITY;
+  // Microsecond-exact, for the same reason the cursor is: a read position and a message can
+  // fall in the same millisecond, and Date.parse would then report an unread message as read.
+  const since = lastReadAt ? parseInstant(lastReadAt) : null;
+  const after = (createdAt: string): boolean => {
+    if (!since) return true;                       // no read cursor: everything is unread
+    const at = parseInstant(createdAt);
+    if (!at) return false;                         // unparseable: never counted, never guessed
+    if (at.seconds !== since.seconds) return at.seconds > since.seconds;
+    return at.micros > since.micros;
+  };
   return messages.filter(m =>
     !m.deleted_at &&
     m.author_actor_id !== actorId &&
-    Date.parse(m.created_at) > since
+    after(m.created_at)
   ).length;
 }

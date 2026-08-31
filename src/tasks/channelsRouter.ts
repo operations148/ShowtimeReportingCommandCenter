@@ -355,6 +355,10 @@ export function registerChannelRoutes(
     let hasMoreBefore = false;
 
     if (after) {
+      // `after.createdAt` is the EXACT text PostgreSQL emitted for that message, passed back
+      // unparsed. PostgREST casts the filter value to the column's timestamptz type, so the
+      // comparison happens at full microsecond precision inside the database — the bound is
+      // exact, and the in-memory trim below then only has to drop the boundary row itself.
       const { data, error } = await base()
         .gte('created_at', after.createdAt)
         .order('created_at', { ascending: true }).order('id', { ascending: true })
@@ -557,20 +561,49 @@ export function registerChannelRoutes(
     const channelId = v.requireUuid(req.params.channelId, 'channelId');
     await loadReadableChannel(ctx, channelId);
 
-    // The caller may name the message they have read up to; the TIMESTAMP is always taken
-    // from that message's own server-assigned created_at, never from the request. Without a
-    // message id the cursor advances to now().
+    /**
+     * The read position is ALWAYS a timestamp the database generated, resolved by message id.
+     * A client-supplied timestamp is never accepted, and the application's own clock is never
+     * used either — it is neither the database's clock nor microsecond-exact, so a cursor set
+     * from it could sit between two messages that share a millisecond and permanently hide one.
+     *
+     * With a message id: that message's own created_at, taken verbatim (PostgREST returns it
+     * as microsecond-precision text, which is passed straight back unparsed).
+     * Without one: the newest message in the channel — "read to here" — again its exact
+     * created_at. An empty channel has nothing to read, so the cursor is left unset.
+     */
     const messageId = v.optionalUuid(req.body?.lastReadMessageId, 'lastReadMessageId');
-    let lastReadAt = new Date().toISOString();
+    let lastReadAt: string | null = null;
+    let resolvedMessageId: string | null = messageId;
+
     if (messageId) {
       const m = await loadMessage(ctx, channelId, messageId);
       lastReadAt = m.created_at;
+    } else {
+      const { data: newest, error: nErr } = await supabaseAdmin.from('task_channel_messages')
+        .select('id, created_at')
+        .eq('workspace_id', ctx.workspaceId).eq('channel_id', channelId)
+        .order('created_at', { ascending: false }).order('id', { ascending: false })
+        .limit(1).maybeSingle();
+      if (nErr) throw mapDbError(nErr, 'resolve newest message');
+      if (newest) {
+        lastReadAt = (newest as any).created_at;
+        resolvedMessageId = (newest as any).id;
+      }
+    }
+
+    if (lastReadAt === null) {
+      // Nothing has ever been posted here, so there is nothing to mark read and no honest
+      // timestamp to record. Reported as already-read rather than inventing a position.
+      return ok(res, {
+        channelId, lastReadAt: null, lastReadMessageId: null, unreadCount: 0
+      });
     }
 
     const { data, error } = await supabaseAdmin.from('task_channel_reads')
       .upsert({
         workspace_id: ctx.workspaceId, channel_id: channelId, actor_id: actor.actorId,
-        last_read_at: lastReadAt, last_read_message_id: messageId,
+        last_read_at: lastReadAt, last_read_message_id: resolvedMessageId,
         updated_at: new Date().toISOString()
       }, { onConflict: 'workspace_id,channel_id,actor_id' })
       .select('channel_id, last_read_at, last_read_message_id').single();
